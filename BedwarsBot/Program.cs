@@ -2664,6 +2664,7 @@ UUID: {binding.BjdUuid}
             return;
         }
 
+        var displayPlayerName = GetDisplayPlayerIdForCurrentSource(playerName);
         await SendPendingUpdateToGroupIfExistsAsync(groupId, msgId, userId);
 
         var perfTotal = Stopwatch.StartNew();
@@ -2745,7 +2746,7 @@ UUID: {binding.BjdUuid}
                 apiResult.JsonResponse!,
                 avatarSrc,
                 playerInfo.Uuid,
-                playerName,
+                displayPlayerName,
                 bwxpShow,
                 modeToken,
                 backgroundSrc,
@@ -2964,6 +2965,7 @@ UUID: {binding.BjdUuid}
             return;
         }
 
+        var displayPlayerName = GetDisplayPlayerIdForCurrentSource(playerName);
         await SendPendingUpdateToGroupIfExistsAsync(groupId, msgId, userId);
 
         var playerApiTask = RequestPlayerInfoAsync(playerName);
@@ -3006,7 +3008,7 @@ UUID: {binding.BjdUuid}
                 apiResult.JsonResponse!,
                 avatarSrc,
                 playerInfo.Uuid,
-                playerName,
+                displayPlayerName,
                 chipIconSize,
                 swxpShow,
                 customTitleBadgeHtml);
@@ -3343,6 +3345,7 @@ UUID: {binding.BjdUuid}
         days = Math.Clamp(days, 1, 400);
         await SendPendingUpdateToGroupIfExistsAsync(groupId, msgId, userId);
 
+        var displayPlayerName = GetDisplayPlayerIdForCurrentSource(playerName);
         var apiResult = await RequestGameStatsAsync(playerName);
         if (!apiResult.Success)
         {
@@ -3350,7 +3353,11 @@ UUID: {binding.BjdUuid}
             return;
         }
 
-        var (img, reminder) = await _sessionService.GenerateSessionImageAsync(apiResult.JsonResponse!, playerName, days);
+        var (img, reminder) = await _sessionService.GenerateSessionImageAsync(
+            apiResult.JsonResponse!,
+            playerName,
+            days,
+            displayPlayerName);
         var shouldSendIntro = !string.IsNullOrWhiteSpace(userId)
                               && _userTracker != null
                               && _userTracker.CheckAndMarkFirstTime(userId);
@@ -4192,6 +4199,7 @@ UUID: {binding.BjdUuid}
         try
         {
             var targetName = string.IsNullOrWhiteSpace(snapshot.DisplayName) ? playerName : snapshot.DisplayName;
+            var displayTargetName = GetDisplayPlayerIdForCurrentSource(targetName);
             var playerUuid = snapshot.PlayerUuid;
             if (string.IsNullOrWhiteSpace(playerUuid))
             {
@@ -4222,7 +4230,7 @@ UUID: {binding.BjdUuid}
                 snapshot.JsonResponse,
                 avatarSrc,
                 playerUuid,
-                targetName,
+                displayTargetName,
                 null,
                 null,
                 backgroundSrc,
@@ -5080,6 +5088,7 @@ UUID: {binding.BjdUuid}
             playerName = binding.BjdName;
         }
 
+        var displayPlayerName = GetDisplayPlayerIdForCurrentSource(playerName);
         await SendPendingUpdateToGroupIfExistsAsync(groupId, msgId, userId);
 
         var apiResult = await RequestLeaderboardAsync(playerName);
@@ -5096,7 +5105,7 @@ UUID: {binding.BjdUuid}
         if (lbApiCode == 404)
         {
             var lbMsg = ParseApiMessage(apiResult.JsonResponse) ?? "未上榜.";
-            await SendGroupMessageAsync(groupId, msgId, $"ℹ️ {playerName} {lbMsg}");
+            await SendGroupMessageAsync(groupId, msgId, $"ℹ️ {displayPlayerName} {lbMsg}");
             return;
         }
 
@@ -5115,7 +5124,7 @@ UUID: {binding.BjdUuid}
             var avatarSrc = _infoPhotoService.TryBuildAvatarDataUri(playerInfo.Uuid);
             using var imgStream = await _lbService.GenerateLeaderboardImageAsync(
                 apiResult.JsonResponse!,
-                playerName,
+                displayPlayerName,
                 avatarSrc,
                 playerInfo.Uuid);
 
@@ -6167,6 +6176,37 @@ UUID: {binding.BjdUuid}
         return _currentMessageSource.Value == MessageSource.OfficialGroup;
     }
 
+    private static string GetDisplayPlayerIdForCurrentSource(string playerId)
+    {
+        if (!IsOfficialGroupMessageSource())
+        {
+            return playerId;
+        }
+
+        return MaskPlayerId(playerId);
+    }
+
+    private static string MaskPlayerId(string playerId)
+    {
+        if (string.IsNullOrWhiteSpace(playerId))
+        {
+            return playerId;
+        }
+
+        var trimmed = playerId.Trim();
+        if (trimmed.Length <= 1)
+        {
+            return "*";
+        }
+
+        if (trimmed.Length == 2)
+        {
+            return $"{trimmed[0]}*";
+        }
+
+        return $"{trimmed[0]}{new string('*', trimmed.Length - 2)}{trimmed[^1]}";
+    }
+
     private static string? BuildGroupImageAtPrefix()
     {
         var requesterUserId = _currentGroupRequesterUserId.Value;
@@ -6305,23 +6345,18 @@ UUID: {binding.BjdUuid}
         if (IsNapcatGroupMessageSource())
         {
             if (_napcatBot == null) return null;
-            if (!string.IsNullOrWhiteSpace(imageAtPrefix))
-            {
-                LogBotTextSend("group", groupId, imageAtPrefix);
-                await _napcatBot.SendTextAndGetMessageIdAsync(groupId, imageAtPrefix);
-            }
-
-            LogBotImageSend("group", groupId, caption);
-            return await _napcatBot.SendImageAndGetMessageIdAsync(groupId, img, caption);
+            var napcatCaption = CombineImageCaptionWithAtPrefix(imageAtPrefix, caption);
+            LogBotImageSend("group", groupId, napcatCaption);
+            return await _napcatBot.SendImageAndGetMessageIdAsync(groupId, img, napcatCaption);
         }
 
         if (IsOfficialGroupMessageSource())
         {
             if (_qqBot == null || string.IsNullOrEmpty(msgId)) return null;
-            var msgSeq = GetNextMsgSeq(msgId);
             var officialCaption = CombineImageCaptionWithAtPrefix(imageAtPrefix, caption);
+            var imageMsgSeq = GetNextMsgSeq(msgId);
             LogBotImageSend("group", groupId, officialCaption);
-            return await _qqBot.SendImageAndGetMessageIdAsync(groupId, msgId, img, msgSeq, officialCaption, useEventId: true);
+            return await _qqBot.SendImageAndGetMessageIdAsync(groupId, msgId, img, imageMsgSeq, officialCaption, useEventId: true);
         }
 
         if (_napcatBot != null && (_qqBot == null || string.IsNullOrEmpty(msgId)))

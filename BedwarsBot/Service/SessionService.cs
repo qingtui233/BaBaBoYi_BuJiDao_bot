@@ -188,7 +188,11 @@ public class SessionService
     // ==========================================
     // 核心 2：生成涨幅图 (带时间穿梭逻辑)
     // ==========================================
-    public async Task<(Stream ImageStream, string ReminderText)> GenerateSessionImageAsync(string jsonResponse, string playerName, int targetDays)
+    public async Task<(Stream ImageStream, string ReminderText)> GenerateSessionImageAsync(
+        string jsonResponse,
+        string playerName,
+        int targetDays,
+        string? displayNameOverride = null)
     {
         var root = JsonConvert.DeserializeObject<ApiResponse>(jsonResponse);
         if (root?.Data == null) throw new Exception("数据解析为空");
@@ -208,6 +212,7 @@ public class SessionService
 
         string todayDate = DateTime.Now.ToString("yyyy-MM-dd");
         string realName = string.IsNullOrEmpty(data.Name) ? playerName : data.Name;
+        string displayName = string.IsNullOrWhiteSpace(displayNameOverride) ? realName : displayNameOverride.Trim();
 
         // 1. 静默缓存今天的数据
         SaveDailyStats(realName, todayDate, fkdr, fk, bblr, bb, winRate, wins);
@@ -246,7 +251,7 @@ public class SessionService
             {
                 if (targetDays <= 7)
                 {
-                    reminderText = $"💡 哎呀，{realName} 最早的数据只到 {actualDays} 天前 ({targetStat.Date})，先按这个基准给你算啦！";
+                    reminderText = $"💡 哎呀，{displayName} 最早的数据只到 {actualDays} 天前 ({targetStat.Date})，先按这个基准给你算啦！";
                 }
                 else
                 {
@@ -256,7 +261,7 @@ public class SessionService
         }
 
         // 4. 生成 HTML
-        string html = BuildHtml(realName, history, fkdr, fk, bblr, bb, winRate, wins, targetStat, extraHtmlNotice);
+        string html = BuildHtml(displayName, history, fkdr, fk, bblr, bb, winRate, wins, targetStat, extraHtmlNotice);
 
         // 5. 截图
         using var page = await _browser.NewPageAsync();
