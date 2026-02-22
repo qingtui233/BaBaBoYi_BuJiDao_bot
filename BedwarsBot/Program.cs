@@ -78,6 +78,8 @@ class Program
     private static readonly Dictionary<string, int> _msgSeqMap = new(StringComparer.Ordinal);
     private static readonly object _customTitleApprovalLock = new();
     private static readonly Dictionary<string, PendingCustomTitleRequest> _pendingCustomTitleRequests = new(StringComparer.Ordinal);
+    private static readonly Dictionary<string, PendingSkinAddRequest> _pendingSkinAddRequests = new(StringComparer.Ordinal);
+    private static readonly Dictionary<string, PendingPlayerIdFontSizeRequest> _pendingPlayerIdFontSizeRequests = new(StringComparer.Ordinal);
     private static readonly object _pendingUpdateLock = new();
     private static string? _pendingUpdateText;
     private static readonly HashSet<string> _pendingUpdateDeliveredUsers = new(StringComparer.Ordinal);
@@ -152,6 +154,23 @@ class Program
         public string ApplicantBjdUuid { get; init; } = string.Empty;
         public string Title { get; init; } = string.Empty;
         public string ColorHex { get; init; } = "FFFFFF";
+        public DateTimeOffset CreatedAtUtc { get; init; } = DateTimeOffset.UtcNow;
+    }
+
+    private sealed class PendingSkinAddRequest
+    {
+        public string ApplicantQq { get; init; } = string.Empty;
+        public string ApplicantBjdName { get; init; } = string.Empty;
+        public string ApplicantBjdUuid { get; init; } = string.Empty;
+        public string OfficialId { get; init; } = string.Empty;
+        public DateTimeOffset CreatedAtUtc { get; init; } = DateTimeOffset.UtcNow;
+    }
+
+    private sealed class PendingPlayerIdFontSizeRequest
+    {
+        public string ApplicantQq { get; init; } = string.Empty;
+        public string ApplicantBjdName { get; init; } = string.Empty;
+        public int IdFontSize { get; init; }
         public DateTimeOffset CreatedAtUtc { get; init; } = DateTimeOffset.UtcNow;
     }
 
@@ -1090,9 +1109,65 @@ class Program
                 return;
             }
 
-            var officialId = parts[2];
-            await SendGroupMessageAsync(groupId, safeMsgId, $"🖼️ 正在绑定皮肤: {officialId}");
+            var officialId = parts[2].Trim();
+            if (string.IsNullOrWhiteSpace(officialId))
+            {
+                await SendGroupMessageAsync(groupId, safeMsgId, "❌ 正版ID不能为空。");
+                return;
+            }
 
+            if (IsOfficialGroupMessageSource())
+            {
+                if (!_bindService.TryGetBindingByQq(userId, out var binding) || string.IsNullOrWhiteSpace(binding.BjdUuid))
+                {
+                    await SendGroupMessageAsync(groupId, safeMsgId, "❌ 未检测到你的绑定信息，请先执行 !bind <布吉岛用户名>");
+                    return;
+                }
+
+                if (!string.Equals(groupId, CustomTitleReviewGroupId, StringComparison.Ordinal))
+                {
+                    await SendGroupMessageAsync(groupId, safeMsgId, $"""
+📝 皮肤绑定审核已迁移到官方群：{CustomTitleReviewGroupId}。
+请先加入该群，再在群内发送：!skin add <正版ID>
+管理员在审核群发送“同意”后即生效。
+""");
+                    return;
+                }
+
+                var displayOfficialId = MaskPlayerId(officialId);
+                var reviewContent = $"""
+【皮肤绑定申请】
+申请QQ: {userId}
+布吉岛ID: {binding.BjdName}
+UUID: {binding.BjdUuid}
+正版ID: {displayOfficialId}
+管理员在本群发送“同意”即可通过（回复本条可精准通过该申请）。
+""";
+
+                var reviewMessageId = await SendGroupMessageWithIdAsync(CustomTitleReviewGroupId, safeMsgId, reviewContent);
+                if (string.IsNullOrWhiteSpace(reviewMessageId))
+                {
+                    await SendGroupMessageAsync(groupId, safeMsgId, "❌ 申请提交失败：无法发送到审核群。");
+                    return;
+                }
+
+                lock (_customTitleApprovalLock)
+                {
+                    _pendingSkinAddRequests[reviewMessageId] = new PendingSkinAddRequest
+                    {
+                        ApplicantQq = userId,
+                        ApplicantBjdName = binding.BjdName,
+                        ApplicantBjdUuid = binding.BjdUuid,
+                        OfficialId = officialId,
+                        CreatedAtUtc = DateTimeOffset.UtcNow
+                    };
+                }
+
+                await SendGroupMessageAsync(groupId, safeMsgId, "✅ 已提交皮肤绑定申请，等待管理员在本群发送“同意”通过。");
+                return;
+            }
+
+            await SendGroupMessageAsync(groupId, safeMsgId, $"🖼️ 正在绑定皮肤: {officialId}");
             var skinResult = await _infoPhotoService.AddSkinAsync(userId, officialId, _bindService);
             await SendGroupMessageAsync(groupId, safeMsgId, skinResult.Message);
             return;
@@ -2542,6 +2617,62 @@ UUID: {binding.BjdUuid}
 
         if (parts.Length >= 2 && parts[1].Equals("id", StringComparison.OrdinalIgnoreCase))
         {
+            if (parts.Length < 3 || !int.TryParse(parts[2], out var idFontSize))
+            {
+                await SendGroupMessageAsync(groupId, msgId, $"❌ 用法: !bg id <大小像素> ({minIdFontSize}-{maxIdFontSize})");
+                return;
+            }
+
+            idFontSize = Math.Clamp(idFontSize, minIdFontSize, maxIdFontSize);
+
+            if (IsOfficialGroupMessageSource())
+            {
+                if (!string.Equals(groupId, CustomTitleReviewGroupId, StringComparison.Ordinal))
+                {
+                    await SendGroupMessageAsync(groupId, msgId, $"""
+📝 ID字号审核已迁移到官方群：{CustomTitleReviewGroupId}。
+请先加入该群，再在群内发送：!bg id <大小像素>
+管理员在审核群发送“同意”后即生效。
+""");
+                    return;
+                }
+
+                var applicantName = "未绑定";
+                if (_bindService.TryGetBindingByQq(userId, out var binding) && !string.IsNullOrWhiteSpace(binding.BjdName))
+                {
+                    applicantName = binding.BjdName;
+                }
+
+                var reviewContent = $"""
+【ID字号申请】
+申请QQ: {userId}
+申请人: {applicantName}
+目标字号: {idFontSize}px（范围 {minIdFontSize}-{maxIdFontSize}）
+管理员在本群发送“同意”即可通过（回复本条可精准通过该申请）。
+""";
+
+                var reviewMessageId = await SendGroupMessageWithIdAsync(CustomTitleReviewGroupId, msgId, reviewContent);
+                if (string.IsNullOrWhiteSpace(reviewMessageId))
+                {
+                    await SendGroupMessageAsync(groupId, msgId, "❌ 申请提交失败：无法发送到审核群。");
+                    return;
+                }
+
+                lock (_customTitleApprovalLock)
+                {
+                    _pendingPlayerIdFontSizeRequests[reviewMessageId] = new PendingPlayerIdFontSizeRequest
+                    {
+                        ApplicantQq = userId,
+                        ApplicantBjdName = applicantName,
+                        IdFontSize = idFontSize,
+                        CreatedAtUtc = DateTimeOffset.UtcNow
+                    };
+                }
+
+                await SendGroupMessageAsync(groupId, msgId, "✅ 已提交ID字号申请，等待管理员在本群发送“同意”通过。");
+                return;
+            }
+
             if (string.IsNullOrWhiteSpace(_adminQq))
             {
                 await SendGroupMessageAsync(groupId, msgId, "❌ 未配置管理员QQ，无法设置ID字号。");
@@ -2554,13 +2685,6 @@ UUID: {binding.BjdUuid}
                 return;
             }
 
-            if (parts.Length < 3 || !int.TryParse(parts[2], out var idFontSize))
-            {
-                await SendGroupMessageAsync(groupId, msgId, $"❌ 用法: !bg id <大小像素> ({minIdFontSize}-{maxIdFontSize})");
-                return;
-            }
-
-            idFontSize = Math.Clamp(idFontSize, minIdFontSize, maxIdFontSize);
             _dataStore.SetPlayerIdFontSize(idFontSize);
             await SendGroupMessageAsync(groupId, msgId, $"✅ ID字号已设置为 {idFontSize}px（全局生效，范围 {minIdFontSize}-{maxIdFontSize}，默认 14）");
             return;
@@ -3421,42 +3545,160 @@ UUID: {binding.BjdUuid}
             return false;
         }
 
-        PendingCustomTitleRequest? request;
+        PendingCustomTitleRequest? customTitleRequest;
+        PendingSkinAddRequest? skinAddRequest;
+        PendingPlayerIdFontSizeRequest? playerIdFontSizeRequest;
         lock (_customTitleApprovalLock)
         {
-            request = null;
+            customTitleRequest = null;
+            skinAddRequest = null;
+            playerIdFontSizeRequest = null;
 
             if (!string.IsNullOrWhiteSpace(replyMessageId)
-                && _pendingCustomTitleRequests.TryGetValue(replyMessageId, out var repliedRequest))
+                && _pendingCustomTitleRequests.TryGetValue(replyMessageId, out var repliedCustomTitleRequest))
             {
-                request = repliedRequest;
+                customTitleRequest = repliedCustomTitleRequest;
                 _pendingCustomTitleRequests.Remove(replyMessageId);
             }
-
-            if (request == null && _pendingCustomTitleRequests.Count > 0)
+            else if (!string.IsNullOrWhiteSpace(replyMessageId)
+                     && _pendingSkinAddRequests.TryGetValue(replyMessageId, out var repliedSkinAddRequest))
             {
-                var oldest = _pendingCustomTitleRequests
-                    .OrderBy(x => x.Value.CreatedAtUtc)
-                    .First();
-                request = oldest.Value;
-                _pendingCustomTitleRequests.Remove(oldest.Key);
+                skinAddRequest = repliedSkinAddRequest;
+                _pendingSkinAddRequests.Remove(replyMessageId);
+            }
+            else if (!string.IsNullOrWhiteSpace(replyMessageId)
+                     && _pendingPlayerIdFontSizeRequests.TryGetValue(replyMessageId, out var repliedPlayerIdFontSizeRequest))
+            {
+                playerIdFontSizeRequest = repliedPlayerIdFontSizeRequest;
+                _pendingPlayerIdFontSizeRequests.Remove(replyMessageId);
+            }
+
+            if (customTitleRequest == null && skinAddRequest == null && playerIdFontSizeRequest == null)
+            {
+                var oldestType = 0;
+                var oldestKey = string.Empty;
+                var oldestCreatedAtUtc = DateTimeOffset.MaxValue;
+
+                if (_pendingCustomTitleRequests.Count > 0)
+                {
+                    var oldest = _pendingCustomTitleRequests
+                        .OrderBy(x => x.Value.CreatedAtUtc)
+                        .First();
+                    oldestType = 1;
+                    oldestKey = oldest.Key;
+                    oldestCreatedAtUtc = oldest.Value.CreatedAtUtc;
+                }
+
+                if (_pendingSkinAddRequests.Count > 0)
+                {
+                    var oldest = _pendingSkinAddRequests
+                        .OrderBy(x => x.Value.CreatedAtUtc)
+                        .First();
+                    if (oldest.Value.CreatedAtUtc < oldestCreatedAtUtc)
+                    {
+                        oldestType = 2;
+                        oldestKey = oldest.Key;
+                        oldestCreatedAtUtc = oldest.Value.CreatedAtUtc;
+                    }
+                }
+
+                if (_pendingPlayerIdFontSizeRequests.Count > 0)
+                {
+                    var oldest = _pendingPlayerIdFontSizeRequests
+                        .OrderBy(x => x.Value.CreatedAtUtc)
+                        .First();
+                    if (oldest.Value.CreatedAtUtc < oldestCreatedAtUtc)
+                    {
+                        oldestType = 3;
+                        oldestKey = oldest.Key;
+                    }
+                }
+
+                switch (oldestType)
+                {
+                    case 1:
+                        customTitleRequest = _pendingCustomTitleRequests[oldestKey];
+                        _pendingCustomTitleRequests.Remove(oldestKey);
+                        break;
+                    case 2:
+                        skinAddRequest = _pendingSkinAddRequests[oldestKey];
+                        _pendingSkinAddRequests.Remove(oldestKey);
+                        break;
+                    case 3:
+                        playerIdFontSizeRequest = _pendingPlayerIdFontSizeRequests[oldestKey];
+                        _pendingPlayerIdFontSizeRequests.Remove(oldestKey);
+                        break;
+                }
             }
         }
 
-        if (request == null)
+        if (customTitleRequest == null && skinAddRequest == null && playerIdFontSizeRequest == null)
         {
-            await SendGroupMessageAsync(groupId, msgId, "❌ 当前没有待审核的称号申请。");
+            await SendGroupMessageAsync(groupId, msgId, "❌ 当前没有待审核申请。");
             return true;
         }
 
-        _dataStore.UpsertCustomTitle(request.ApplicantBjdUuid, request.Title, request.ColorHex);
-        await SendGroupMessageAsync(groupId, msgId,
-            $"✅ 已通过：{request.ApplicantBjdName} 的称号申请 -> {request.Title} (#{request.ColorHex})");
-
-        if (_napcatBot != null)
+        if (customTitleRequest != null)
         {
-            await SendPrivateMessageAsync(request.ApplicantQq,
-                $"✅ 你的称号申请已通过：{request.Title} (#{request.ColorHex})");
+            _dataStore.UpsertCustomTitle(customTitleRequest.ApplicantBjdUuid, customTitleRequest.Title, customTitleRequest.ColorHex);
+            await SendGroupMessageAsync(groupId, msgId,
+                $"✅ 已通过：{customTitleRequest.ApplicantBjdName} 的称号申请 -> {customTitleRequest.Title} (#{customTitleRequest.ColorHex})");
+
+            if (_napcatBot != null)
+            {
+                await SendPrivateMessageAsync(customTitleRequest.ApplicantQq,
+                    $"✅ 你的称号申请已通过：{customTitleRequest.Title} (#{customTitleRequest.ColorHex})");
+            }
+
+            return true;
+        }
+
+        if (skinAddRequest != null)
+        {
+            var skinResult = await _infoPhotoService.AddSkinAsync(skinAddRequest.ApplicantQq, skinAddRequest.OfficialId, _bindService);
+            var maskedOfficialId = MaskPlayerId(skinAddRequest.OfficialId);
+            if (skinResult.Success)
+            {
+                await SendGroupMessageAsync(groupId, msgId,
+                    $"✅ 已通过：{skinAddRequest.ApplicantBjdName} 的皮肤申请 -> {maskedOfficialId}");
+
+                if (_napcatBot != null)
+                {
+                    await SendPrivateMessageAsync(skinAddRequest.ApplicantQq,
+                        $"✅ 你的皮肤申请已通过：{skinAddRequest.OfficialId}");
+                }
+            }
+            else
+            {
+                var groupDetail = skinResult.Message.Replace(
+                    skinAddRequest.OfficialId,
+                    maskedOfficialId,
+                    StringComparison.OrdinalIgnoreCase);
+                await SendGroupMessageAsync(groupId, msgId, $"❌ 皮肤申请处理失败：{groupDetail}");
+
+                if (_napcatBot != null)
+                {
+                    await SendPrivateMessageAsync(skinAddRequest.ApplicantQq,
+                        $"❌ 你的皮肤申请未通过：{skinResult.Message}");
+                }
+            }
+
+            return true;
+        }
+
+        if (playerIdFontSizeRequest != null)
+        {
+            _dataStore.SetPlayerIdFontSize(playerIdFontSizeRequest.IdFontSize);
+            await SendGroupMessageAsync(groupId, msgId,
+                $"✅ 已通过：{playerIdFontSizeRequest.ApplicantBjdName} 的ID字号申请 -> {playerIdFontSizeRequest.IdFontSize}px");
+
+            if (_napcatBot != null)
+            {
+                await SendPrivateMessageAsync(playerIdFontSizeRequest.ApplicantQq,
+                    $"✅ 你的ID字号申请已通过：{playerIdFontSizeRequest.IdFontSize}px");
+            }
+
+            return true;
         }
 
         return true;
