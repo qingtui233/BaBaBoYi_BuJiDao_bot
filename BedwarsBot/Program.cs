@@ -87,6 +87,7 @@ class Program
     private static readonly ConcurrentDictionary<string, bool> _callModerationCache = new(StringComparer.OrdinalIgnoreCase);
     private static bool _aiModerationEnabled = true;
     private static readonly ConcurrentDictionary<string, BwQuickReplyContext> _bwQuickReplyContexts = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, IdiomChainSession> _idiomChainSessions = new(StringComparer.Ordinal);
     private static readonly string[] LocalBlockedCallKeywords =
     {
         "习近平", "共产党", "中共", "六四", "天安门事件", "法轮功", "台独", "港独", "藏独", "疆独", "颠覆国家政权",
@@ -103,6 +104,8 @@ class Program
     private const int CallModerationCacheMaxEntries = 1200;
     private static readonly TimeSpan BwQuickReplyContextTtl = TimeSpan.FromHours(12);
     private const int BwQuickReplyContextMaxEntries = 8000;
+    private static readonly TimeSpan IdiomChainSessionTimeout = TimeSpan.FromMinutes(20);
+    private const int IdiomChainMaxUsedCount = 300;
     private const int MsgSeqMapMaxEntries = 4096;
     private static long _lastApiCacheMaintenanceTicksUtc;
     private static readonly object _leaderboardUrlLock = new();
@@ -152,6 +155,14 @@ class Program
     }
 
     private sealed record BwQuickReplyContext(string PlayerName, DateTimeOffset CreatedAtUtc);
+    private sealed class IdiomChainSession
+    {
+        public SemaphoreSlim Gate { get; } = new(1, 1);
+        public HashSet<string> UsedIdioms { get; } = new(StringComparer.Ordinal);
+        public string LastIdiom { get; set; } = string.Empty;
+        public string ExpectedStartChar { get; set; } = string.Empty;
+        public DateTimeOffset LastUpdatedUtc { get; set; } = DateTimeOffset.UtcNow;
+    }
 
     private sealed class TeeTextWriter : TextWriter
     {
@@ -366,7 +377,7 @@ class Program
                 _napcatBot.OnPrivateMessage += HandleNapcatPrivateMessageAsync;
                 await _napcatBot.StartAsync();
                 _ = Task.Run(() => RunNapcatDailyUsageReporterAsync(exitCts.Token));
-                Console.WriteLine(">>> NapCat 机器人已就绪！可用指令: !bw <ID> [模式] / !bw <ID> <x年x月x日> / !sw <ID> / !lb <ID> / !sess bw [玩家名] [t天数] / /喊话 [几月几日几点几分] / !bind <布吉岛名> / !skin add <正版ID> / /skin up / !bg / !bg set <透明度> / !bg icon <像素> / !bg id <像素> / !bg cl <颜色ID> / !help / /群发 / /群发编辑 <文本>");
+                Console.WriteLine(">>> NapCat 机器人已就绪！可用指令: !bw <ID> [模式] / !bw <ID> <x年x月x日> / !sw <ID> / !lb <ID> / !sess bw [玩家名] [t天数] / /喊话 [几月几日几点几分] / !bind <布吉岛名> / !skin add <正版ID> / /skin up / !bg / !bg set <透明度> / !bg icon <像素> / !bg id <像素> / !bg cl <颜色ID> / !help / /群发 / /群发编辑 <文本> / 成语接龙 [开局成语] / 结束接龙 / 接龙提示");
             }
 
             if (enableOfficial)
@@ -732,6 +743,11 @@ class Program
             }
 
             if (await TryHandleCallEchoInGroupAsync(normalizedMsg, groupId, msgId, userId))
+            {
+                return;
+            }
+
+            if (await TryHandleNapcatIdiomChainAsync(groupId, msgId, userId, normalizedMsg))
             {
                 return;
             }
@@ -1396,6 +1412,674 @@ class Program
 
         await SendPrivateMessageAsync(userId, callText);
         return true;
+    }
+
+    private sealed record IdiomRoundResult(bool Valid, string Normalized, string Next, string Reason);
+    private sealed record IdiomSuggestResult(bool Success, string Idiom, string Reason);
+
+    private static async Task<bool> TryHandleNapcatIdiomChainAsync(string groupId, string msgId, string? userId, string normalizedMsg)
+    {
+        if (string.IsNullOrWhiteSpace(groupId) || string.IsNullOrWhiteSpace(normalizedMsg))
+        {
+            return false;
+        }
+
+        if (TryGetPrefixedCommandToken(normalizedMsg, out var prefixedCmd)
+            && !IsIdiomChainCommandToken(prefixedCmd))
+        {
+            return false;
+        }
+
+        var controlText = NormalizeIdiomControlText(normalizedMsg);
+        var hasSession = TryGetActiveIdiomChainSession(groupId, out var session);
+
+        if (IsIdiomChainStopText(controlText))
+        {
+            if (!hasSession || session == null)
+            {
+                await SendGroupMessageAsync(groupId, msgId, "ℹ️ 当前没有进行中的成语接龙。发送“成语接龙”即可开始。");
+                return true;
+            }
+
+            await session.Gate.WaitAsync();
+            try
+            {
+                var usedCount = session.UsedIdioms.Count;
+                _idiomChainSessions.TryRemove(groupId, out _);
+                _dataStore.IncrementNapcatUsage();
+                await SendGroupMessageAsync(groupId, msgId, $"✅ 已结束本群成语接龙，共记录 {usedCount} 个成语。");
+            }
+            finally
+            {
+                session.Gate.Release();
+            }
+
+            return true;
+        }
+
+        if (TryParseIdiomChainStartRequest(controlText, out var openingIdiomRaw))
+        {
+            session ??= _idiomChainSessions.GetOrAdd(groupId, _ => new IdiomChainSession());
+            await session.Gate.WaitAsync();
+            try
+            {
+                session.UsedIdioms.Clear();
+                session.LastIdiom = string.Empty;
+                session.ExpectedStartChar = string.Empty;
+                session.LastUpdatedUtc = DateTimeOffset.UtcNow;
+
+                if (string.IsNullOrWhiteSpace(openingIdiomRaw))
+                {
+                    var start = await RequestDeepSeekIdiomSuggestionAsync(string.Empty, session.UsedIdioms);
+                    if (!start.Success || !TryNormalizeIdiomText(start.Idiom, out var firstIdiom))
+                    {
+                        var reason = string.IsNullOrWhiteSpace(start.Reason) ? "DeepSeek 暂时不可用，请稍后重试。" : start.Reason;
+                        await SendGroupMessageAsync(groupId, msgId, $"❌ 成语接龙启动失败：{reason}");
+                        return true;
+                    }
+
+                    session.UsedIdioms.Add(firstIdiom);
+                    session.LastIdiom = firstIdiom;
+                    session.ExpectedStartChar = GetLastChineseChar(firstIdiom);
+                    session.LastUpdatedUtc = DateTimeOffset.UtcNow;
+                    _dataStore.IncrementNapcatUsage();
+
+                    await SendGroupMessageAsync(
+                        groupId,
+                        msgId,
+                        $"🎯 成语接龙开始！我先来：{firstIdiom}\n请接以“{session.ExpectedStartChar}”开头的四字成语。\n发送“结束接龙”可结束，发送“接龙提示”可求助。");
+                    return true;
+                }
+
+                if (!TryNormalizeIdiomText(openingIdiomRaw, out var openingIdiom))
+                {
+                    await SendGroupMessageAsync(groupId, msgId, "❌ 开局成语格式不正确，请发送标准四字成语。");
+                    return true;
+                }
+
+                var round = await RequestDeepSeekIdiomRoundAsync(openingIdiom, string.Empty, session.UsedIdioms);
+                if (!round.Valid)
+                {
+                    await SendGroupMessageAsync(groupId, msgId, $"❌ 开局失败：{round.Reason}");
+                    return true;
+                }
+
+                session.UsedIdioms.Add(round.Normalized);
+                if (!string.IsNullOrWhiteSpace(round.Next))
+                {
+                    session.UsedIdioms.Add(round.Next);
+                }
+
+                if (session.UsedIdioms.Count > IdiomChainMaxUsedCount)
+                {
+                    session.UsedIdioms.Clear();
+                    session.UsedIdioms.Add(round.Normalized);
+                    if (!string.IsNullOrWhiteSpace(round.Next))
+                    {
+                        session.UsedIdioms.Add(round.Next);
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(round.Next))
+                {
+                    _idiomChainSessions.TryRemove(groupId, out _);
+                    _dataStore.IncrementNapcatUsage();
+                    await SendGroupMessageAsync(
+                        groupId,
+                        msgId,
+                        $"✅ 开局成语：{round.Normalized}\n我一时接不上，你赢了！发送“成语接龙”可再开一局。");
+                    return true;
+                }
+
+                session.LastIdiom = round.Next;
+                session.ExpectedStartChar = GetLastChineseChar(round.Next);
+                session.LastUpdatedUtc = DateTimeOffset.UtcNow;
+                _dataStore.IncrementNapcatUsage();
+
+                await SendGroupMessageAsync(
+                    groupId,
+                    msgId,
+                    $"✅ 开局成语：{round.Normalized}\n我接：{round.Next}\n请接以“{session.ExpectedStartChar}”开头的四字成语。");
+                return true;
+            }
+            finally
+            {
+                session.Gate.Release();
+            }
+        }
+
+        if (!hasSession || session == null)
+        {
+            return false;
+        }
+
+        if (IsIdiomChainHintText(controlText))
+        {
+            await session.Gate.WaitAsync();
+            try
+            {
+                var expected = session.ExpectedStartChar;
+                if (string.IsNullOrWhiteSpace(expected))
+                {
+                    await SendGroupMessageAsync(groupId, msgId, "ℹ️ 当前没有等待接龙的首字，请重新发送“成语接龙”开始。");
+                    return true;
+                }
+
+                var hint = await RequestDeepSeekIdiomSuggestionAsync(expected, session.UsedIdioms);
+                if (!hint.Success || !TryNormalizeIdiomText(hint.Idiom, out var hintIdiom))
+                {
+                    var reason = string.IsNullOrWhiteSpace(hint.Reason) ? "暂时想不到提示，你可以换个成语试试。" : hint.Reason;
+                    await SendGroupMessageAsync(groupId, msgId, $"ℹ️ {reason}");
+                    return true;
+                }
+
+                await SendGroupMessageAsync(groupId, msgId, $"💡 提示：可以试试“{hintIdiom}”（首字“{expected}”）。");
+                _dataStore.IncrementNapcatUsage();
+                return true;
+            }
+            finally
+            {
+                session.Gate.Release();
+            }
+        }
+
+        if (!TryNormalizeIdiomText(controlText, out var userIdiom))
+        {
+            return false;
+        }
+
+        await session.Gate.WaitAsync();
+        try
+        {
+            if (DateTimeOffset.UtcNow - session.LastUpdatedUtc > IdiomChainSessionTimeout)
+            {
+                _idiomChainSessions.TryRemove(groupId, out _);
+                await SendGroupMessageAsync(groupId, msgId, "⌛ 这局成语接龙已超时结束。发送“成语接龙”可重新开始。");
+                return true;
+            }
+
+            if (!string.IsNullOrWhiteSpace(session.ExpectedStartChar))
+            {
+                var expected = session.ExpectedStartChar[0];
+                if (userIdiom[0] != expected)
+                {
+                    await SendGroupMessageAsync(groupId, msgId, $"❌ 这个成语应以“{session.ExpectedStartChar}”开头，请重试。");
+                    return true;
+                }
+            }
+
+            if (session.UsedIdioms.Contains(userIdiom))
+            {
+                await SendGroupMessageAsync(groupId, msgId, $"❌ “{userIdiom}”已经用过了，换一个。");
+                return true;
+            }
+
+            var roundResult = await RequestDeepSeekIdiomRoundAsync(userIdiom, session.ExpectedStartChar, session.UsedIdioms);
+            if (!roundResult.Valid)
+            {
+                await SendGroupMessageAsync(groupId, msgId, $"❌ {roundResult.Reason}");
+                return true;
+            }
+
+            session.UsedIdioms.Add(roundResult.Normalized);
+            if (!string.IsNullOrWhiteSpace(roundResult.Next))
+            {
+                session.UsedIdioms.Add(roundResult.Next);
+            }
+
+            if (session.UsedIdioms.Count > IdiomChainMaxUsedCount)
+            {
+                session.UsedIdioms.Clear();
+                session.UsedIdioms.Add(roundResult.Normalized);
+                if (!string.IsNullOrWhiteSpace(roundResult.Next))
+                {
+                    session.UsedIdioms.Add(roundResult.Next);
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(roundResult.Next))
+            {
+                _idiomChainSessions.TryRemove(groupId, out _);
+                _dataStore.IncrementNapcatUsage();
+                await SendGroupMessageAsync(
+                    groupId,
+                    msgId,
+                    $"✅ 你出：{roundResult.Normalized}\n我接不上了，这局你赢！发送“成语接龙”可再来一局。");
+                return true;
+            }
+
+            session.LastIdiom = roundResult.Next;
+            session.ExpectedStartChar = GetLastChineseChar(roundResult.Next);
+            session.LastUpdatedUtc = DateTimeOffset.UtcNow;
+            _dataStore.IncrementNapcatUsage();
+            await SendGroupMessageAsync(
+                groupId,
+                msgId,
+                $"✅ 你出：{roundResult.Normalized}\n🤖 我接：{roundResult.Next}\n请接以“{session.ExpectedStartChar}”开头的四字成语。");
+            return true;
+        }
+        finally
+        {
+            session.Gate.Release();
+        }
+    }
+
+    private static bool TryGetActiveIdiomChainSession(string groupId, out IdiomChainSession? session)
+    {
+        session = null;
+        if (!_idiomChainSessions.TryGetValue(groupId, out var existing))
+        {
+            return false;
+        }
+
+        if (DateTimeOffset.UtcNow - existing.LastUpdatedUtc > IdiomChainSessionTimeout)
+        {
+            _idiomChainSessions.TryRemove(groupId, out _);
+            return false;
+        }
+
+        session = existing;
+        return true;
+    }
+
+    private static bool TryGetPrefixedCommandToken(string text, out string commandToken)
+    {
+        commandToken = string.Empty;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var trimmed = text.TrimStart();
+        if (trimmed.Length == 0)
+        {
+            return false;
+        }
+
+        var first = trimmed[0];
+        if (first != '/' && first != '!' && first != '=' && first != '／' && first != '！' && first != '＝')
+        {
+            return false;
+        }
+
+        trimmed = trimmed[1..].TrimStart();
+        if (trimmed.Length == 0)
+        {
+            return false;
+        }
+
+        var parts = trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0)
+        {
+            return false;
+        }
+
+        commandToken = NormalizeCommand(parts[0]);
+        return !string.IsNullOrWhiteSpace(commandToken);
+    }
+
+    private static bool IsIdiomChainCommandToken(string commandToken)
+    {
+        return commandToken is "成语接龙" or "接龙"
+            or "结束接龙" or "停止接龙" or "退出接龙" or "结束成语接龙" or "停止成语接龙"
+            or "接龙提示" or "提示接龙";
+    }
+
+    private static string NormalizeIdiomControlText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        var normalized = text.Replace('\u3000', ' ').Trim();
+        while (normalized.Length > 0)
+        {
+            var first = normalized[0];
+            if (first != '/' && first != '!' && first != '=' && first != '／' && first != '！' && first != '＝')
+            {
+                break;
+            }
+
+            normalized = normalized[1..].TrimStart();
+        }
+
+        return normalized.Trim();
+    }
+
+    private static bool TryParseIdiomChainStartRequest(string controlText, out string openingIdiom)
+    {
+        openingIdiom = string.Empty;
+        if (string.IsNullOrWhiteSpace(controlText))
+        {
+            return false;
+        }
+
+        var text = controlText.Trim();
+        if (text.Equals("成语接龙", StringComparison.OrdinalIgnoreCase)
+            || text.Equals("接龙", StringComparison.OrdinalIgnoreCase)
+            || text.Equals("来个成语接龙", StringComparison.OrdinalIgnoreCase)
+            || text.Equals("来一局成语接龙", StringComparison.OrdinalIgnoreCase)
+            || text.Equals("玩成语接龙", StringComparison.OrdinalIgnoreCase)
+            || text.Equals("开始成语接龙", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (text.StartsWith("成语接龙", StringComparison.OrdinalIgnoreCase))
+        {
+            var tail = text["成语接龙".Length..].Trim();
+            if (string.IsNullOrWhiteSpace(tail))
+            {
+                return true;
+            }
+
+            if (IsIdiomChainStopText(tail) || IsIdiomChainHintText(tail))
+            {
+                return false;
+            }
+
+            openingIdiom = tail;
+            return true;
+        }
+
+        if (text.StartsWith("接龙", StringComparison.OrdinalIgnoreCase))
+        {
+            var tail = text["接龙".Length..].Trim();
+            if (string.IsNullOrWhiteSpace(tail))
+            {
+                return true;
+            }
+
+            if (IsIdiomChainStopText(tail) || IsIdiomChainHintText(tail))
+            {
+                return false;
+            }
+
+            openingIdiom = tail;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsIdiomChainStopText(string controlText)
+    {
+        if (string.IsNullOrWhiteSpace(controlText))
+        {
+            return false;
+        }
+
+        var text = controlText.Trim();
+        return text is "结束接龙" or "停止接龙" or "退出接龙"
+            or "结束成语接龙" or "停止成语接龙"
+            or "接龙结束" or "接龙停止" or "接龙退出"
+            or "不玩了";
+    }
+
+    private static bool IsIdiomChainHintText(string controlText)
+    {
+        if (string.IsNullOrWhiteSpace(controlText))
+        {
+            return false;
+        }
+
+        var text = controlText.Trim();
+        return text is "提示" or "接龙提示" or "提示接龙" or "来个提示" or "不会" or "接不上了";
+    }
+
+    private static bool TryNormalizeIdiomText(string text, out string idiom)
+    {
+        idiom = string.Empty;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var normalized = text.Replace('\u3000', ' ').Trim();
+        var builder = new StringBuilder(4);
+        foreach (var ch in normalized)
+        {
+            if (IsChineseChar(ch))
+            {
+                builder.Append(ch);
+                continue;
+            }
+
+            if (char.IsWhiteSpace(ch))
+            {
+                continue;
+            }
+
+            if ("，,。！？!?；;：:\"“”‘’'()（）【】[]《》<>-—·.".Contains(ch))
+            {
+                continue;
+            }
+
+            return false;
+        }
+
+        if (builder.Length != 4)
+        {
+            return false;
+        }
+
+        idiom = builder.ToString();
+        return true;
+    }
+
+    private static bool IsChineseChar(char ch)
+    {
+        return ch >= '\u4E00' && ch <= '\u9FFF';
+    }
+
+    private static string GetLastChineseChar(string idiom)
+    {
+        if (string.IsNullOrWhiteSpace(idiom))
+        {
+            return string.Empty;
+        }
+
+        for (var i = idiom.Length - 1; i >= 0; i--)
+        {
+            if (IsChineseChar(idiom[i]))
+            {
+                return idiom[i].ToString();
+            }
+        }
+
+        return string.Empty;
+    }
+
+    private static string BuildUsedIdiomsPrompt(IReadOnlyCollection<string> usedIdioms)
+    {
+        if (usedIdioms == null || usedIdioms.Count == 0)
+        {
+            return "(空)";
+        }
+
+        var text = string.Join("、", usedIdioms.Take(120));
+        if (text.Length > 1500)
+        {
+            text = text[..1500];
+        }
+
+        return text;
+    }
+
+    private static async Task<IdiomRoundResult> RequestDeepSeekIdiomRoundAsync(string userIdiom, string expectedStartChar, IReadOnlyCollection<string> usedIdioms)
+    {
+        try
+        {
+            var body = new
+            {
+                model = DeepSeekModelName,
+                temperature = 0.2,
+                messages = new object[]
+                {
+                    new
+                    {
+                        role = "system",
+                        content = "你是中文成语接龙裁判。仅输出单个JSON对象，不要markdown。字段：{\"valid\":true/false,\"normalized\":\"四字成语\",\"next\":\"四字成语或空字符串\",\"reason\":\"简短中文\"}。规则：1) normalized必须是常见四字成语；2) 若expected_start非空，normalized首字必须等于expected_start；3) normalized与next都不能出现在used；4) next首字必须等于normalized末字；5) 若玩家输入不合法，valid=false且next为空；6) 若玩家合法但你接不上，valid=true且next为空。"
+                    },
+                    new
+                    {
+                        role = "user",
+                        content = $"expected_start={expectedStartChar}\nplayer_idiom={userIdiom}\nused={BuildUsedIdiomsPrompt(usedIdioms)}\n请返回JSON。"
+                    }
+                }
+            };
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, DeepSeekApiUrl);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", DeepSeekApiKey);
+            request.Content = new StringContent(JsonConvert.SerializeObject(body), Encoding.UTF8, "application/json");
+
+            using var response = await _httpClient.SendAsync(request);
+            var content = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"[成语接龙] DeepSeek请求失败: status={(int)response.StatusCode}, body={content}");
+                return new IdiomRoundResult(false, userIdiom, string.Empty, "DeepSeek 请求失败，请稍后重试。");
+            }
+
+            var root = JObject.Parse(content);
+            var raw = root.SelectToken("choices[0].message.content")?.ToString() ?? string.Empty;
+            var jsonText = ExtractJsonObject(raw);
+            if (string.IsNullOrWhiteSpace(jsonText))
+            {
+                return new IdiomRoundResult(false, userIdiom, string.Empty, "DeepSeek 返回格式异常。");
+            }
+
+            var obj = JObject.Parse(jsonText);
+            var validToken = obj["valid"] ?? obj["ok"] ?? obj["accepted"] ?? obj["正确"];
+            var reason = obj["reason"]?.ToString() ?? obj["message"]?.ToString() ?? "不符合成语接龙规则。";
+            var normalizedRaw = obj["normalized"]?.ToString() ?? obj["idiom"]?.ToString() ?? userIdiom;
+            var nextRaw = obj["next"]?.ToString() ?? obj["bot"]?.ToString() ?? string.Empty;
+
+            var valid = false;
+            if (validToken != null)
+            {
+                _ = TryParseBoolToken(validToken, out valid);
+            }
+
+            if (!TryNormalizeIdiomText(normalizedRaw, out var normalized))
+            {
+                normalized = userIdiom;
+            }
+
+            if (!valid)
+            {
+                if (string.IsNullOrWhiteSpace(reason))
+                {
+                    reason = "这个词不是有效的四字成语。";
+                }
+
+                return new IdiomRoundResult(false, normalized, string.Empty, reason);
+            }
+
+            if (!string.IsNullOrWhiteSpace(expectedStartChar) && normalized[0].ToString() != expectedStartChar)
+            {
+                return new IdiomRoundResult(false, normalized, string.Empty, $"应以“{expectedStartChar}”开头。");
+            }
+
+            if (usedIdioms.Contains(normalized))
+            {
+                return new IdiomRoundResult(false, normalized, string.Empty, $"“{normalized}”已经用过了。");
+            }
+
+            if (!TryNormalizeIdiomText(nextRaw, out var next))
+            {
+                return new IdiomRoundResult(true, normalized, string.Empty, reason);
+            }
+
+            var expectedNextStart = GetLastChineseChar(normalized);
+            if (string.IsNullOrWhiteSpace(expectedNextStart) || next[0].ToString() != expectedNextStart)
+            {
+                return new IdiomRoundResult(true, normalized, string.Empty, reason);
+            }
+
+            if (usedIdioms.Contains(next) || string.Equals(next, normalized, StringComparison.Ordinal))
+            {
+                return new IdiomRoundResult(true, normalized, string.Empty, reason);
+            }
+
+            return new IdiomRoundResult(true, normalized, next, reason);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[成语接龙] DeepSeek回合异常: {ex.Message}");
+            return new IdiomRoundResult(false, userIdiom, string.Empty, "DeepSeek 异常，请稍后重试。");
+        }
+    }
+
+    private static async Task<IdiomSuggestResult> RequestDeepSeekIdiomSuggestionAsync(string expectedStartChar, IReadOnlyCollection<string> usedIdioms)
+    {
+        try
+        {
+            var body = new
+            {
+                model = DeepSeekModelName,
+                temperature = 0.8,
+                messages = new object[]
+                {
+                    new
+                    {
+                        role = "system",
+                        content = "你是中文成语助手。请只输出单个JSON对象，不要markdown。字段：{\"idiom\":\"四字成语\",\"reason\":\"简短中文\"}。要求：idiom必须是常见四字成语，且不在used列表；若expected_start非空，idiom首字必须等于expected_start。"
+                    },
+                    new
+                    {
+                        role = "user",
+                        content = $"expected_start={expectedStartChar}\nused={BuildUsedIdiomsPrompt(usedIdioms)}\n请返回JSON。"
+                    }
+                }
+            };
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, DeepSeekApiUrl);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", DeepSeekApiKey);
+            request.Content = new StringContent(JsonConvert.SerializeObject(body), Encoding.UTF8, "application/json");
+
+            using var response = await _httpClient.SendAsync(request);
+            var content = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"[成语接龙] DeepSeek提示失败: status={(int)response.StatusCode}, body={content}");
+                return new IdiomSuggestResult(false, string.Empty, "DeepSeek 请求失败。");
+            }
+
+            var root = JObject.Parse(content);
+            var raw = root.SelectToken("choices[0].message.content")?.ToString() ?? string.Empty;
+            var jsonText = ExtractJsonObject(raw);
+            if (string.IsNullOrWhiteSpace(jsonText))
+            {
+                return new IdiomSuggestResult(false, string.Empty, "DeepSeek 返回格式异常。");
+            }
+
+            var obj = JObject.Parse(jsonText);
+            var idiomRaw = obj["idiom"]?.ToString() ?? obj["next"]?.ToString() ?? obj["word"]?.ToString() ?? string.Empty;
+            var reason = obj["reason"]?.ToString() ?? string.Empty;
+            if (!TryNormalizeIdiomText(idiomRaw, out var idiom))
+            {
+                return new IdiomSuggestResult(false, string.Empty, "DeepSeek 未返回有效四字成语。");
+            }
+
+            if (!string.IsNullOrWhiteSpace(expectedStartChar) && idiom[0].ToString() != expectedStartChar)
+            {
+                return new IdiomSuggestResult(false, string.Empty, "DeepSeek 提示首字不匹配。");
+            }
+
+            if (usedIdioms.Contains(idiom))
+            {
+                return new IdiomSuggestResult(false, string.Empty, "DeepSeek 提示成语已用过。");
+            }
+
+            return new IdiomSuggestResult(true, idiom, reason);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[成语接龙] DeepSeek提示异常: {ex.Message}");
+            return new IdiomSuggestResult(false, string.Empty, "DeepSeek 异常。");
+        }
     }
 
     private static bool TryExtractCallText(string input, out string callText)
@@ -5501,7 +6185,7 @@ UUID: {binding.BjdUuid}
             }
 
             LogBotTextSend("group", groupId, content);
-            return await _qqBot.SendTextAndGetMessageIdAsync(groupId, officialReferenceMsgId, content, officialMsgSeq);
+            return await _qqBot.SendTextAndGetMessageIdAsync(groupId, officialReferenceMsgId, content, officialMsgSeq, useEventId: true);
         }
 
         if (_napcatBot != null && (_qqBot == null || string.IsNullOrWhiteSpace(msgId)))
@@ -5542,7 +6226,7 @@ UUID: {binding.BjdUuid}
             if (_qqBot == null || string.IsNullOrEmpty(msgId)) return Task.CompletedTask;
             var msgSeq = GetNextMsgSeq(msgId);
             LogBotTextSend("group", groupId, content);
-            return _qqBot.SendTextAsync(groupId, msgId, content, msgSeq);
+            return _qqBot.SendTextAsync(groupId, msgId, content, msgSeq, useEventId: true);
         }
 
         if (_napcatBot != null && (_qqBot == null || string.IsNullOrEmpty(msgId)))
@@ -5578,7 +6262,7 @@ UUID: {binding.BjdUuid}
             if (_qqBot == null || string.IsNullOrEmpty(msgId)) return null;
             var msgSeq = GetNextMsgSeq(msgId);
             LogBotImageSend("group", groupId, caption);
-            return await _qqBot.SendImageAndGetMessageIdAsync(groupId, msgId, img, msgSeq, caption);
+            return await _qqBot.SendImageAndGetMessageIdAsync(groupId, msgId, img, msgSeq, caption, useEventId: true);
         }
 
         if (_napcatBot != null && (_qqBot == null || string.IsNullOrEmpty(msgId)))
@@ -5630,7 +6314,8 @@ UUID: {binding.BjdUuid}
         var tracked = cmd is "bw" or "lb" or "sess" or "session" or "help" or "帮助" or "喊话"
             or "sw"
             or "bind" or "skin" or "bg" or "ch" or "群发" or "群发编辑" or "群发编辑文本"
-            or "update" or "更新" or "开关ai" or "ai开关" or "起床文本";
+            or "update" or "更新" or "开关ai" or "ai开关" or "起床文本"
+            or "成语接龙" or "接龙" or "结束接龙" or "停止接龙" or "退出接龙";
         if (tracked)
         {
             _dataStore.IncrementNapcatUsage();

@@ -320,12 +320,12 @@ public class QQBotV2
         }, token);
     }
 
-    public async Task SendTextAsync(string openId, string msgId, string content, int? msgSeq = null)
+    public async Task SendTextAsync(string openId, string msgId, string content, int? msgSeq = null, bool useEventId = false)
     {
-        _ = await SendTextAndGetMessageIdAsync(openId, msgId, content, msgSeq);
+        _ = await SendTextAndGetMessageIdAsync(openId, msgId, content, msgSeq, useEventId);
     }
 
-    public async Task<string?> SendTextAndGetMessageIdAsync(string openId, string msgId, string content, int? msgSeq = null)
+    public async Task<string?> SendTextAndGetMessageIdAsync(string openId, string msgId, string content, int? msgSeq = null, bool useEventId = false)
     {
         var url = $"https://api.sgroup.qq.com/v2/groups/{openId}/messages";
         var basePayload = new Dictionary<string, object>
@@ -335,14 +335,7 @@ public class QQBotV2
         };
 
         var payload = new Dictionary<string, object>(basePayload);
-        if (!string.IsNullOrWhiteSpace(msgId))
-        {
-            payload["msg_id"] = msgId;
-            if (msgSeq.HasValue)
-            {
-                payload["msg_seq"] = msgSeq.Value;
-            }
-        }
+        AppendReferencePayload(payload, msgId, msgSeq, useEventId);
 
         var (statusCode, body) = await PostJsonAsync(url, payload);
         if (statusCode == HttpStatusCode.OK || statusCode == HttpStatusCode.Created)
@@ -350,17 +343,10 @@ public class QQBotV2
             return TryParseMessageId(body);
         }
 
-        var errCode = TryParseErrCode(body);
-        if (errCode == 40011000 && !string.IsNullOrWhiteSpace(msgId))
+        if (!string.IsNullOrWhiteSpace(msgId))
         {
-            var fallbackPayload = new Dictionary<string, object>(basePayload)
-            {
-                ["event_id"] = msgId
-            };
-            if (msgSeq.HasValue)
-            {
-                fallbackPayload["msg_seq"] = msgSeq.Value;
-            }
+            var fallbackPayload = new Dictionary<string, object>(basePayload);
+            AppendReferencePayload(fallbackPayload, msgId, msgSeq, !useEventId);
 
             var (retryStatusCode, retryBody) = await PostJsonAsync(url, fallbackPayload);
             if (retryStatusCode == HttpStatusCode.OK || retryStatusCode == HttpStatusCode.Created)
@@ -376,16 +362,16 @@ public class QQBotV2
         return null;
     }
 
-    public async Task SendImageAsync(string openId, string msgId, Stream img, int? msgSeq = null, string? caption = null)
+    public async Task SendImageAsync(string openId, string msgId, Stream img, int? msgSeq = null, string? caption = null, bool useEventId = false)
     {
-        _ = await SendImageAndGetMessageIdAsync(openId, msgId, img, msgSeq, caption);
+        _ = await SendImageAndGetMessageIdAsync(openId, msgId, img, msgSeq, caption, useEventId);
     }
 
-    public async Task<string?> SendImageAndGetMessageIdAsync(string openId, string msgId, Stream img, int? msgSeq = null, string? caption = null)
+    public async Task<string?> SendImageAndGetMessageIdAsync(string openId, string msgId, Stream img, int? msgSeq = null, string? caption = null, bool useEventId = false)
     {
         if (!_imageHostUploader.IsEnabled)
         {
-            await SendTextAsync(openId, msgId, "未配置图床，无法发送图片。请在 pz/config.json 配置 ImageHost。", msgSeq);
+            await SendTextAsync(openId, msgId, "未配置图床，无法发送图片。请在 pz/config.json 配置 ImageHost。", msgSeq, useEventId);
             return null;
         }
 
@@ -400,21 +386,21 @@ public class QQBotV2
         var uploadResult = await _imageHostUploader.UploadAsync(bytes, $"bw_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}.jpg");
         if (!uploadResult.Success || string.IsNullOrWhiteSpace(uploadResult.Url))
         {
-            await SendTextAsync(openId, msgId, uploadResult.Message, msgSeq);
+            await SendTextAsync(openId, msgId, uploadResult.Message, msgSeq, useEventId);
             return null;
         }
 
         var fileInfoResult = await UploadGroupFileAsync(openId, uploadResult.Url);
         if (!fileInfoResult.Success || string.IsNullOrWhiteSpace(fileInfoResult.FileInfo))
         {
-            await SendTextAsync(openId, msgId, $"上传群文件失败，改为发送链接: {uploadResult.Url}", msgSeq);
+            await SendTextAsync(openId, msgId, $"上传群文件失败，改为发送链接: {uploadResult.Url}", msgSeq, useEventId);
             return null;
         }
 
-        var sentMessageId = await SendRichMediaMessageAndGetMessageIdAsync(openId, msgId, fileInfoResult.FileInfo, msgSeq, caption);
+        var sentMessageId = await SendRichMediaMessageAndGetMessageIdAsync(openId, msgId, fileInfoResult.FileInfo, msgSeq, caption, useEventId);
         if (sentMessageId == null)
         {
-            await SendTextAsync(openId, msgId, $"图片富媒体发送失败，链接: {uploadResult.Url}", msgSeq);
+            await SendTextAsync(openId, msgId, $"图片富媒体发送失败，链接: {uploadResult.Url}", msgSeq, useEventId);
             return null;
         }
 
@@ -560,7 +546,7 @@ public class QQBotV2
         }
     }
 
-    private async Task<string?> SendRichMediaMessageAndGetMessageIdAsync(string openId, string msgId, string fileInfo, int? msgSeq, string? caption)
+    private async Task<string?> SendRichMediaMessageAndGetMessageIdAsync(string openId, string msgId, string fileInfo, int? msgSeq, string? caption, bool useEventId)
     {
         var url = $"https://api.sgroup.qq.com/v2/groups/{openId}/messages";
         var content = string.IsNullOrWhiteSpace(caption) ? " " : caption;
@@ -570,11 +556,7 @@ public class QQBotV2
             ["msg_type"] = 7,
             ["media"] = new Dictionary<string, object> { ["file_info"] = fileInfo }
         };
-        if (!string.IsNullOrWhiteSpace(msgId))
-        {
-            payload["msg_id"] = msgId;
-            if (msgSeq.HasValue) payload["msg_seq"] = msgSeq.Value;
-        }
+        AppendReferencePayload(payload, msgId, msgSeq, useEventId);
 
         var (statusCode, body) = await PostJsonAsync(url, payload);
         if (statusCode == HttpStatusCode.OK || statusCode == HttpStatusCode.Created)
@@ -582,17 +564,15 @@ public class QQBotV2
             return TryParseMessageId(body) ?? string.Empty;
         }
 
-        var errCode = TryParseErrCode(body);
-        if (errCode == 40011000 && !string.IsNullOrWhiteSpace(msgId))
+        if (!string.IsNullOrWhiteSpace(msgId))
         {
             var fallback = new Dictionary<string, object>
             {
                 ["content"] = content,
                 ["msg_type"] = 7,
-                ["media"] = new Dictionary<string, object> { ["file_info"] = fileInfo },
-                ["event_id"] = msgId
+                ["media"] = new Dictionary<string, object> { ["file_info"] = fileInfo }
             };
-            if (msgSeq.HasValue) fallback["msg_seq"] = msgSeq.Value;
+            AppendReferencePayload(fallback, msgId, msgSeq, !useEventId);
 
             var (retryStatusCode, retryBody) = await PostJsonAsync(url, fallback);
             if (retryStatusCode == HttpStatusCode.OK || retryStatusCode == HttpStatusCode.Created)
@@ -606,6 +586,20 @@ public class QQBotV2
 
         Console.WriteLine($"[Bot] 富媒体发送失败: {(int)statusCode} {statusCode}, body={body}");
         return null;
+    }
+
+    private static void AppendReferencePayload(Dictionary<string, object> payload, string msgId, int? msgSeq, bool useEventId)
+    {
+        if (string.IsNullOrWhiteSpace(msgId))
+        {
+            return;
+        }
+
+        payload[useEventId ? "event_id" : "msg_id"] = msgId;
+        if (msgSeq.HasValue)
+        {
+            payload["msg_seq"] = msgSeq.Value;
+        }
     }
 
     private static int? TryParseErrCode(string? body)
