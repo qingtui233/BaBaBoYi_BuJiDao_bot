@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("BedwarsBot")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+69d3db70964293e6d006eb79e26ed12de6cf3486")]
 [assembly: System.Reflection.AssemblyProductAttribute("BedwarsBot")]
 [assembly: System.Reflection.AssemblyTitleAttribute("BedwarsBot")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

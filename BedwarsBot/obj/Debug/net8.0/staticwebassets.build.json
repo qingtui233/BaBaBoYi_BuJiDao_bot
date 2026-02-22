@@ -1,1 +1,11 @@
-{"Version":1,"Hash":"3kwW0h6PvfKGGt8MTgBsndwmUdaEMzkEggeueDvs8RA=","Source":"BedwarsBot","BasePath":"_content/BedwarsBot","Mode":"Default","ManifestType":"Build","ReferencedProjectsConfiguration":[],"DiscoveryPatterns":[],"Assets":[],"Endpoints":[]}
+{
+  "Version": 1,
+  "Hash": "qfPSApPsH6dAmoHDxiUmKy1v9oBUufPV/eQhVMi4xU4=",
+  "Source": "BedwarsBot",
+  "BasePath": "_content/BedwarsBot",
+  "Mode": "Default",
+  "ManifestType": "Build",
+  "ReferencedProjectsConfiguration": [],
+  "DiscoveryPatterns": [],
+  "Assets": []
+}
