@@ -1,0 +1,16 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BedwarsBot", "BedwarsBot\BedwarsBot.csproj", "{61F286B7-1D76-4473-AAA8-D616C17C584F}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{61F286B7-1D76-4473-AAA8-D616C17C584F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{61F286B7-1D76-4473-AAA8-D616C17C584F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{61F286B7-1D76-4473-AAA8-D616C17C584F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{61F286B7-1D76-4473-AAA8-D616C17C584F}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
