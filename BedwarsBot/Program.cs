@@ -143,6 +143,7 @@ class Program
     }
 
     private static readonly AsyncLocal<MessageSource> _currentMessageSource = new();
+    private static readonly AsyncLocal<string?> _currentGroupRequesterUserId = new();
 
     private sealed class PendingCustomTitleRequest
     {
@@ -450,6 +451,7 @@ class Program
     private static async Task HandleGroupAtMessageAsync(GroupAtMessage message)
     {
         var previousSource = _currentMessageSource.Value;
+        var previousGroupRequesterUserId = _currentGroupRequesterUserId.Value;
         _currentMessageSource.Value = MessageSource.OfficialGroup;
         try
         {
@@ -458,6 +460,7 @@ class Program
             var groupId = message.GroupOpenId;
             var userId = message.AuthorId;
             var msgId = message.MessageId;
+            _currentGroupRequesterUserId.Value = userId;
 
             var content = message.Content ?? string.Empty;
             var trimmedContent = content.TrimStart();
@@ -685,12 +688,14 @@ class Program
         finally
         {
             _currentMessageSource.Value = previousSource;
+            _currentGroupRequesterUserId.Value = previousGroupRequesterUserId;
         }
     }
 
     private static async Task HandleNapcatGroupMessageAsync(NapcatGroupMessage message)
     {
         var previousSource = _currentMessageSource.Value;
+        var previousGroupRequesterUserId = _currentGroupRequesterUserId.Value;
         _currentMessageSource.Value = MessageSource.NapcatGroup;
         try
         {
@@ -699,6 +704,7 @@ class Program
             var groupId = message.GroupId;
             var userId = message.UserId;
             var msgId = message.MessageId;
+            _currentGroupRequesterUserId.Value = userId;
 
             var backgroundResult = await _backgroundCommand.TryHandlePendingAsync(message.Raw, groupId, userId);
             if (backgroundResult.IsHandled)
@@ -929,13 +935,16 @@ class Program
         finally
         {
             _currentMessageSource.Value = previousSource;
+            _currentGroupRequesterUserId.Value = previousGroupRequesterUserId;
         }
     }
 
     private static async Task HandleNapcatPrivateMessageAsync(NapcatPrivateMessage message)
     {
         var previousSource = _currentMessageSource.Value;
+        var previousGroupRequesterUserId = _currentGroupRequesterUserId.Value;
         _currentMessageSource.Value = MessageSource.NapcatPrivate;
+        _currentGroupRequesterUserId.Value = null;
         try
         {
             var userId = message.UserId;
@@ -1041,6 +1050,7 @@ class Program
         finally
         {
             _currentMessageSource.Value = previousSource;
+            _currentGroupRequesterUserId.Value = previousGroupRequesterUserId;
         }
     }
 
@@ -6147,9 +6157,50 @@ UUID: {binding.BjdUuid}
         return _currentMessageSource.Value is MessageSource.NapcatGroup or MessageSource.NapcatPrivate;
     }
 
+    private static bool IsNapcatGroupMessageSource()
+    {
+        return _currentMessageSource.Value == MessageSource.NapcatGroup;
+    }
+
     private static bool IsOfficialGroupMessageSource()
     {
         return _currentMessageSource.Value == MessageSource.OfficialGroup;
+    }
+
+    private static string? BuildGroupImageAtPrefix()
+    {
+        var requesterUserId = _currentGroupRequesterUserId.Value;
+        if (string.IsNullOrWhiteSpace(requesterUserId))
+        {
+            return null;
+        }
+
+        if (IsOfficialGroupMessageSource())
+        {
+            return $"<@{requesterUserId}>";
+        }
+
+        if (IsNapcatGroupMessageSource())
+        {
+            return $"[CQ:at,qq={requesterUserId}]";
+        }
+
+        return null;
+    }
+
+    private static string? CombineImageCaptionWithAtPrefix(string? atPrefix, string? caption)
+    {
+        if (string.IsNullOrWhiteSpace(atPrefix))
+        {
+            return caption;
+        }
+
+        if (string.IsNullOrWhiteSpace(caption))
+        {
+            return atPrefix;
+        }
+
+        return $"{atPrefix} {caption}";
     }
 
     private static async Task<string?> SendGroupMessageWithIdAsync(string groupId, string? msgId, string content)
@@ -6249,10 +6300,17 @@ UUID: {binding.BjdUuid}
     private static async Task<string?> SendGroupImageAndGetMessageIdAsync(string groupId, string msgId, Stream img, string? caption = null)
     {
         if (string.IsNullOrEmpty(groupId)) return null;
+        var imageAtPrefix = BuildGroupImageAtPrefix();
 
-        if (IsNapcatMessageSource())
+        if (IsNapcatGroupMessageSource())
         {
             if (_napcatBot == null) return null;
+            if (!string.IsNullOrWhiteSpace(imageAtPrefix))
+            {
+                LogBotTextSend("group", groupId, imageAtPrefix);
+                await _napcatBot.SendTextAndGetMessageIdAsync(groupId, imageAtPrefix);
+            }
+
             LogBotImageSend("group", groupId, caption);
             return await _napcatBot.SendImageAndGetMessageIdAsync(groupId, img, caption);
         }
@@ -6261,8 +6319,9 @@ UUID: {binding.BjdUuid}
         {
             if (_qqBot == null || string.IsNullOrEmpty(msgId)) return null;
             var msgSeq = GetNextMsgSeq(msgId);
-            LogBotImageSend("group", groupId, caption);
-            return await _qqBot.SendImageAndGetMessageIdAsync(groupId, msgId, img, msgSeq, caption, useEventId: true);
+            var officialCaption = CombineImageCaptionWithAtPrefix(imageAtPrefix, caption);
+            LogBotImageSend("group", groupId, officialCaption);
+            return await _qqBot.SendImageAndGetMessageIdAsync(groupId, msgId, img, msgSeq, officialCaption, useEventId: true);
         }
 
         if (_napcatBot != null && (_qqBot == null || string.IsNullOrEmpty(msgId)))
