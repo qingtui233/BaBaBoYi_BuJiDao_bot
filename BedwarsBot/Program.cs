@@ -86,6 +86,8 @@ class Program
     private const string DeepSeekApiUrl = "https://api.deepseek.com/chat/completions";
     private const string DeepSeekModelName = "deepseek-chat";
     private const string DeepSeekApiKey = "sk-23056eb740b34f86ad2ab3b562bbae4b";
+    private const string DefaultCallModerationSystemPrompt =
+        "你是中文内容审核器。拦截三类：1) 涉政敏感内容（严格拦截）；2) 直接辱骂/人身攻击（如“傻逼”“你妈”“去死”等）；3) 重度露骨色情或违法性内容。放宽要求：普通情绪表达、轻度暧昧、非露骨色情尽量不拦截。明确放行：仅家庭称谓如“爸爸”“妈妈”“爸爸妈妈”不违规。要识别绕过写法：谐音、拆字、空格或符号穿插、拼音/英文替换。只输出JSON：{\"blocked\":true/false,\"category\":\"politics|abuse|explicit_sex|other|none\",\"severity\":\"high|medium|low\",\"reason\":\"简短中文\"}。";
     private static readonly ConcurrentDictionary<string, bool> _callModerationCache = new(StringComparer.OrdinalIgnoreCase);
     private static bool _aiModerationEnabled = true;
     private static readonly ConcurrentDictionary<string, BwQuickReplyContext> _bwQuickReplyContexts = new(StringComparer.Ordinal);
@@ -97,13 +99,13 @@ class Program
     private static readonly string[] LocalBlockedCallKeywords =
     {
         "习近平", "共产党", "中共", "六四", "天安门事件", "法轮功", "台独", "港独", "藏独", "疆独", "颠覆国家政权",
-        "性交", "做爱", "口交", "肛交", "强奸", "轮奸", "乱伦", "幼女", "未成年性", "性交易", "嫖娼", "援交", "约炮",
-        "成人视频", "黄片", "裸聊", "av女优", "porn",
-        "性暗示", "性器官", "阴茎", "阴道", "乳房", "胸部", "下体", "龟头", "精液", "射精", "勃起", "呻吟", "开房", "湿了"
+        "性交", "做爱", "口交", "肛交", "强奸", "轮奸", "乱伦", "幼女", "未成年性", "性交易", "嫖娼", "援交",
+        "成人视频", "黄片", "裸聊", "av女优", "porn"
     };
-    private static readonly string[] LocalBlockedCallVentingKeywords =
+    private static readonly string[] LocalBlockedCallAbuseKeywords =
     {
-        "发癫", "癫了", "崩溃", "我快疯了", "我要疯了", "受不了了", "毁灭吧", "不想活了", "活不下去", "想死", "气炸了", "炸了"
+        "傻逼", "傻b", "煞笔", "沙比", "弱智", "智障", "脑残", "废物", "狗东西",
+        "你妈", "滚你妈", "死全家", "贱人", "婊子", "操你", "草你", "cnm", "nmsl", "去死吧"
     };
     private static readonly string[] CallTextFamilyAllowKeywords =
     {
@@ -117,6 +119,12 @@ class Program
     {
         "共产党", "中共", "台独", "港独", "藏独", "疆独", "颠覆", "政权", "领导人", "天安门", "六四", "法轮功", "煽动", "分裂"
     };
+    private static string _callModerationSystemPrompt = DefaultCallModerationSystemPrompt;
+    private static string[] _activeBlockedCallKeywords = LocalBlockedCallKeywords;
+    private static string[] _activeBlockedCallAbuseKeywords = LocalBlockedCallAbuseKeywords;
+    private static string[] _activeFamilyAllowKeywords = CallTextFamilyAllowKeywords;
+    private static string[] _activeBenignGeoTerms = BenignGeoTerms;
+    private static string[] _activePoliticalEscalationSignals = PoliticalEscalationSignals;
     private static readonly ConcurrentDictionary<string, ApiResultCacheEntry> _apiResultCache = new(StringComparer.OrdinalIgnoreCase);
     private static readonly TimeSpan GameStatsCacheTtl = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan LeaderboardCacheTtl = TimeSpan.FromSeconds(30);
@@ -136,8 +144,6 @@ class Program
     private static readonly TimeSpan GroupCallRateLimitStateTtl = TimeSpan.FromMinutes(15);
     private static readonly object _groupCallRateLimitLock = new();
     private static readonly Dictionary<string, GroupCallRateLimitState> _groupCallRateLimitStates = new(StringComparer.Ordinal);
-    private static readonly Regex RepeatedEmotionalCharRegex = new(@"([啊呀哇哈呜哦嗯])\1{5,}", RegexOptions.Compiled);
-    private static readonly Regex RepeatedEmotionPunctuationRegex = new(@"([!！?？~～])\1{5,}", RegexOptions.Compiled);
     private static long _lastApiCacheMaintenanceTicksUtc;
     private static readonly object _leaderboardUrlLock = new();
     private static string? _lastWorkingLeaderboardUrl;
@@ -164,6 +170,8 @@ class Program
     private static TextWriter? _originalConsoleOut;
     private static TextWriter? _originalConsoleError;
     private static string? _startupLogPath;
+    private static TextWriter? _callEchoLogWriter;
+    private static string? _callEchoLogPath;
 
     private enum MessageSource
     {
@@ -260,6 +268,16 @@ class Program
         public List<PersistedIdiomChainSession> IdiomChainSessions { get; set; } = new();
     }
 
+    private sealed class CallModerationConfig
+    {
+        public string SystemPrompt { get; set; } = DefaultCallModerationSystemPrompt;
+        public List<string> BlockKeywords { get; set; } = new();
+        public List<string> AbuseKeywords { get; set; } = new();
+        public List<string> FamilyAllowKeywords { get; set; } = new();
+        public List<string> BenignGeoTerms { get; set; } = new();
+        public List<string> PoliticalEscalationSignals { get; set; } = new();
+    }
+
     private sealed class GroupCallRateLimitState
     {
         public Queue<DateTimeOffset> MessageTimesUtc { get; } = new();
@@ -335,6 +353,8 @@ class Program
 
         var rootDir = ResolveRootDirectory();
         InitializeStartupLog(rootDir, DateTime.Now);
+        InitializeCallEchoLog(rootDir);
+        InitializeCallModerationConfig(rootDir);
         Console.WriteLine("=== Bedwars Bot (中文版) 启动中 ===");
         try
         {
@@ -534,6 +554,7 @@ class Program
         finally
         {
             await ShutdownAsync();
+            CloseCallEchoLog();
             CloseStartupLog();
         }
     }
@@ -2529,7 +2550,7 @@ UUID: {binding.BjdUuid}
                     new
                     {
                         role = "system",
-                        content = "你是中文内容审核器。拦截三类：1) 政治相关敏感/涉政词汇；2) 任何性暗示、性器官描述、色情擦边或露骨性内容；3) 发泄类/发癫文（大量情绪宣泄、崩溃式表达），即使不含辱骂也算违规。明确放行：仅家庭称谓如“爸爸”“妈妈”“爸爸妈妈”不违规。要识别绕过写法：谐音、拆字、空格或符号穿插、拼音/英文替换。只输出JSON：{\"blocked\":true/false,\"category\":\"politics|sexual|venting|other|none\",\"severity\":\"high|medium|low\",\"reason\":\"简短中文\"}。"
+                        content = _callModerationSystemPrompt
                     },
                     new
                     {
@@ -2553,34 +2574,34 @@ UUID: {binding.BjdUuid}
 
             var root = JObject.Parse(content);
             var raw = root.SelectToken("choices[0].message.content")?.ToString() ?? string.Empty;
-            if (ContainsDeepSeekViolationHint(raw))
-            {
-                return ShouldBlockByDeepSeekResult(true, "other", "medium", raw, text);
-            }
-
             var jsonText = ExtractJsonObject(raw);
-            if (string.IsNullOrWhiteSpace(jsonText))
+            if (!string.IsNullOrWhiteSpace(jsonText))
             {
+                var obj = JObject.Parse(jsonText);
+                var blockedToken = obj["blocked"] ?? obj["violation"] ?? obj["违规"];
+                var category = obj["category"]?.ToString()
+                               ?? obj["type"]?.ToString()
+                               ?? obj["类别"]?.ToString();
+                var severity = obj["severity"]?.ToString()
+                               ?? obj["level"]?.ToString()
+                               ?? obj["尺度"]?.ToString()
+                               ?? obj["risk"]?.ToString();
+                var reason = obj["reason"]?.ToString()
+                             ?? obj["原因"]?.ToString();
+                if (blockedToken != null && TryParseBoolToken(blockedToken, out var blocked))
+                {
+                    return ShouldBlockByDeepSeekResult(blocked, category, severity, reason, text);
+                }
+
+                if (ShouldBlockByDeepSeekResult(true, category, severity, reason, text))
+                {
+                    return true;
+                }
+
                 return HasLocalBlockedKeyword(text);
             }
 
-            var obj = JObject.Parse(jsonText);
-            var blockedToken = obj["blocked"] ?? obj["violation"] ?? obj["违规"];
-            var category = obj["category"]?.ToString()
-                           ?? obj["type"]?.ToString()
-                           ?? obj["类别"]?.ToString();
-            var severity = obj["severity"]?.ToString()
-                           ?? obj["level"]?.ToString()
-                           ?? obj["尺度"]?.ToString()
-                           ?? obj["risk"]?.ToString();
-            var reason = obj["reason"]?.ToString()
-                         ?? obj["原因"]?.ToString();
-            if (blockedToken != null && TryParseBoolToken(blockedToken, out var blocked))
-            {
-                return ShouldBlockByDeepSeekResult(blocked, category, severity, reason, text);
-            }
-
-            if (ShouldBlockByDeepSeekResult(true, category, severity, reason, text))
+            if (ContainsDeepSeekViolationHint(raw))
             {
                 return true;
             }
@@ -2606,17 +2627,17 @@ UUID: {binding.BjdUuid}
             return !IsBenignCountryMention(originalText, category, reason);
         }
 
-        if (IsSexualModeration(category, severity, reason, originalText))
+        if (IsAbuseModeration(category, reason, originalText))
         {
             return true;
         }
 
-        if (IsVentingModeration(category, reason, originalText))
+        if (IsSexualModeration(category, severity, reason))
         {
             return true;
         }
 
-        return blocked;
+        return blocked && HasLocalBlockedKeyword(originalText);
     }
 
     private static bool IsBenignCountryMention(string originalText, string? category, string? reason)
@@ -2630,7 +2651,7 @@ UUID: {binding.BjdUuid}
         }
 
         var hasGeoTerm = false;
-        foreach (var term in BenignGeoTerms)
+        foreach (var term in _activeBenignGeoTerms)
         {
             var termCompact = BuildCompactModerationText(term);
             if (string.IsNullOrWhiteSpace(termCompact))
@@ -2650,7 +2671,7 @@ UUID: {binding.BjdUuid}
             return false;
         }
 
-        foreach (var signal in PoliticalEscalationSignals)
+        foreach (var signal in _activePoliticalEscalationSignals)
         {
             var signalCompact = BuildCompactModerationText(signal);
             if (string.IsNullOrWhiteSpace(signalCompact))
@@ -2683,20 +2704,49 @@ UUID: {binding.BjdUuid}
                || text.Contains("煽动颠覆", StringComparison.Ordinal);
     }
 
-    private static bool IsSexualModeration(string? category, string? severity, string? reason, string originalText)
+    private static bool IsAbuseModeration(string? category, string? reason, string originalText)
     {
-        var text = $"{category} {severity} {reason}".ToLowerInvariant();
+        var text = $"{category} {reason}".ToLowerInvariant();
         if (string.IsNullOrWhiteSpace(text))
         {
-            return HasLocalBlockedKeyword(originalText);
+            return HasLocalAbuseKeyword(originalText);
         }
 
-        var hasSexSignal =
-            text.Contains("sexual", StringComparison.Ordinal)
-            || text.Contains("sex", StringComparison.Ordinal)
-            || text.Contains("性暗示", StringComparison.Ordinal)
-            || text.Contains("性器官", StringComparison.Ordinal)
-            || text.Contains("擦边", StringComparison.Ordinal)
+        var hasAbuseSignal =
+            text.Contains("abuse", StringComparison.Ordinal)
+            || text.Contains("insult", StringComparison.Ordinal)
+            || text.Contains("harass", StringComparison.Ordinal)
+            || text.Contains("辱骂", StringComparison.Ordinal)
+            || text.Contains("谩骂", StringComparison.Ordinal)
+            || text.Contains("侮辱", StringComparison.Ordinal)
+            || text.Contains("人身攻击", StringComparison.Ordinal)
+            || text.Contains("脏话", StringComparison.Ordinal);
+
+        if (hasAbuseSignal)
+        {
+            return true;
+        }
+
+        return HasLocalAbuseKeyword(originalText);
+    }
+
+    private static bool IsSexualModeration(string? category, string? severity, string? reason)
+    {
+        var text = $"{category} {reason}".ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var severityText = (severity ?? string.Empty).Trim().ToLowerInvariant();
+        var isLowSeverity = severityText is "low" or "mild" or "轻度" or "一般";
+        if (isLowSeverity)
+        {
+            return false;
+        }
+
+        var hasHardSexSignal =
+            text.Contains("explicit_sex", StringComparison.Ordinal)
             || text.Contains("露骨", StringComparison.Ordinal)
             || text.Contains("淫秽", StringComparison.Ordinal)
             || text.Contains("性交易", StringComparison.Ordinal)
@@ -2711,27 +2761,7 @@ UUID: {binding.BjdUuid}
             || text.Contains("援交", StringComparison.Ordinal)
             || text.Contains("裸聊", StringComparison.Ordinal);
 
-        if (hasSexSignal)
-        {
-            return true;
-        }
-
-        return HasLocalBlockedKeyword(originalText);
-    }
-
-    private static bool IsVentingModeration(string? category, string? reason, string originalText)
-    {
-        var text = $"{category} {reason}".ToLowerInvariant();
-        if (text.Contains("vent", StringComparison.Ordinal)
-            || text.Contains("发泄", StringComparison.Ordinal)
-            || text.Contains("发癫", StringComparison.Ordinal)
-            || text.Contains("崩溃", StringComparison.Ordinal)
-            || text.Contains("情绪宣泄", StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        return HasLocalVentingPattern(originalText);
+        return hasHardSexSignal;
     }
 
     private static bool ContainsDeepSeekViolationHint(string rawResponse)
@@ -2769,7 +2799,9 @@ UUID: {binding.BjdUuid}
         }
 
         return normalized.Contains("检测到违规", StringComparison.Ordinal)
-               || normalized.Contains("违规", StringComparison.Ordinal)
+               || normalized.Contains("存在违规", StringComparison.Ordinal)
+               || normalized.Contains("内容违规", StringComparison.Ordinal)
+               || normalized.Contains("已拦截", StringComparison.Ordinal)
                || normalized.Contains("violation", StringComparison.Ordinal)
                || normalized.Contains("blocked", StringComparison.Ordinal);
     }
@@ -2851,7 +2883,7 @@ UUID: {binding.BjdUuid}
 
         var normalized = NormalizeCallText(text).ToLowerInvariant();
         var compact = BuildCompactModerationText(normalized);
-        foreach (var keyword in LocalBlockedCallKeywords)
+        foreach (var keyword in _activeBlockedCallKeywords)
         {
             var normalizedKeyword = NormalizeCallText(keyword).ToLowerInvariant();
             if (!string.IsNullOrWhiteSpace(normalizedKeyword)
@@ -2868,29 +2900,7 @@ UUID: {binding.BjdUuid}
             }
         }
 
-        foreach (var keyword in LocalBlockedCallVentingKeywords)
-        {
-            var normalizedKeyword = NormalizeCallText(keyword).ToLowerInvariant();
-            if (!string.IsNullOrWhiteSpace(normalizedKeyword)
-                && normalized.Contains(normalizedKeyword, StringComparison.Ordinal))
-            {
-                return true;
-            }
-
-            var compactKeyword = BuildCompactModerationText(keyword);
-            if (!string.IsNullOrWhiteSpace(compactKeyword)
-                && compact.Contains(compactKeyword, StringComparison.Ordinal))
-            {
-                return true;
-            }
-        }
-
-        if (HasLocalVentingPattern(normalized))
-        {
-            return true;
-        }
-
-        return false;
+        return HasLocalAbuseKeyword(normalized);
     }
 
     private static bool IsFamilyCallTextAllowed(string text)
@@ -2906,7 +2916,7 @@ UUID: {binding.BjdUuid}
             return false;
         }
 
-        foreach (var keyword in CallTextFamilyAllowKeywords)
+        foreach (var keyword in _activeFamilyAllowKeywords)
         {
             var compactKeyword = BuildCompactModerationText(keyword);
             if (!string.IsNullOrWhiteSpace(compactKeyword)
@@ -2919,7 +2929,7 @@ UUID: {binding.BjdUuid}
         return false;
     }
 
-    private static bool HasLocalVentingPattern(string text)
+    private static bool HasLocalAbuseKeyword(string text)
     {
         if (string.IsNullOrWhiteSpace(text))
         {
@@ -2927,14 +2937,22 @@ UUID: {binding.BjdUuid}
         }
 
         var normalized = NormalizeCallText(text).ToLowerInvariant();
-        if (RepeatedEmotionalCharRegex.IsMatch(normalized))
+        var compact = BuildCompactModerationText(normalized);
+        foreach (var keyword in _activeBlockedCallAbuseKeywords)
         {
-            return true;
-        }
+            var normalizedKeyword = NormalizeCallText(keyword).ToLowerInvariant();
+            if (!string.IsNullOrWhiteSpace(normalizedKeyword)
+                && normalized.Contains(normalizedKeyword, StringComparison.Ordinal))
+            {
+                return true;
+            }
 
-        if (RepeatedEmotionPunctuationRegex.IsMatch(normalized))
-        {
-            return true;
+            var compactKeyword = BuildCompactModerationText(keyword);
+            if (!string.IsNullOrWhiteSpace(compactKeyword)
+                && compact.Contains(compactKeyword, StringComparison.Ordinal))
+            {
+                return true;
+            }
         }
 
         return false;
@@ -7191,6 +7209,101 @@ UUID: {binding.BjdUuid}
         return Directory.GetCurrentDirectory();
     }
 
+    private static void InitializeCallModerationConfig(string rootDir)
+    {
+        try
+        {
+            var configDir = Path.Combine(rootDir, "pz");
+            Directory.CreateDirectory(configDir);
+
+            var configPath = Path.Combine(configDir, "call_moderation.json");
+
+            CallModerationConfig? loadedConfig;
+            if (!File.Exists(configPath))
+            {
+                loadedConfig = BuildDefaultCallModerationConfig();
+                var json = JsonConvert.SerializeObject(loadedConfig, Formatting.Indented);
+                File.WriteAllText(configPath, json + Environment.NewLine, new UTF8Encoding(false));
+                Console.WriteLine($"[叫词审核] 已创建配置文件: {configPath}");
+            }
+            else
+            {
+                var raw = File.ReadAllText(configPath);
+                loadedConfig = JsonConvert.DeserializeObject<CallModerationConfig>(raw);
+            }
+
+            ApplyCallModerationConfig(loadedConfig);
+            Console.WriteLine($"[叫词审核] 已加载配置: {configPath}");
+        }
+        catch (Exception ex)
+        {
+            ApplyCallModerationConfig(null);
+            Console.WriteLine($"[叫词审核] 配置加载失败，已使用默认规则: {ex.Message}");
+        }
+    }
+
+    private static CallModerationConfig BuildDefaultCallModerationConfig()
+    {
+        return new CallModerationConfig
+        {
+            SystemPrompt = DefaultCallModerationSystemPrompt,
+            BlockKeywords = LocalBlockedCallKeywords.ToList(),
+            AbuseKeywords = LocalBlockedCallAbuseKeywords.ToList(),
+            FamilyAllowKeywords = CallTextFamilyAllowKeywords.ToList(),
+            BenignGeoTerms = BenignGeoTerms.ToList(),
+            PoliticalEscalationSignals = PoliticalEscalationSignals.ToList()
+        };
+    }
+
+    private static void ApplyCallModerationConfig(CallModerationConfig? config)
+    {
+        var effective = config ?? BuildDefaultCallModerationConfig();
+        _callModerationSystemPrompt = string.IsNullOrWhiteSpace(effective.SystemPrompt)
+            ? DefaultCallModerationSystemPrompt
+            : effective.SystemPrompt.Trim();
+        _activeBlockedCallKeywords = NormalizeModerationKeywords(effective.BlockKeywords, LocalBlockedCallKeywords);
+        _activeBlockedCallAbuseKeywords = NormalizeModerationKeywords(effective.AbuseKeywords, LocalBlockedCallAbuseKeywords);
+        _activeFamilyAllowKeywords = NormalizeModerationKeywords(effective.FamilyAllowKeywords, CallTextFamilyAllowKeywords);
+        _activeBenignGeoTerms = NormalizeModerationKeywords(effective.BenignGeoTerms, BenignGeoTerms);
+        _activePoliticalEscalationSignals = NormalizeModerationKeywords(effective.PoliticalEscalationSignals, PoliticalEscalationSignals);
+        _callModerationCache.Clear();
+    }
+
+    private static string[] NormalizeModerationKeywords(IEnumerable<string>? raw, IReadOnlyCollection<string> fallback)
+    {
+        var useFallback = raw == null;
+        var source = raw ?? fallback;
+        var result = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in source)
+        {
+            var text = NormalizeCallText(item ?? string.Empty);
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                continue;
+            }
+
+            if (!seen.Add(text))
+            {
+                continue;
+            }
+
+            result.Add(text);
+        }
+
+        if (result.Count > 0)
+        {
+            return result.ToArray();
+        }
+
+        if (!useFallback)
+        {
+            return Array.Empty<string>();
+        }
+
+        return fallback.ToArray();
+    }
+
     private static void InitializeStartupLog(string rootDir, DateTime startupTime)
     {
         var originalOut = Console.Out;
@@ -7231,6 +7344,42 @@ UUID: {binding.BjdUuid}
                 // ignored
             }
         }
+    }
+
+    private static void InitializeCallEchoLog(string rootDir)
+    {
+        try
+        {
+            var logDir = Path.Combine(rootDir, "log");
+            Directory.CreateDirectory(logDir);
+
+            var logPath = Path.Combine(logDir, "call_xx.log");
+            var fileStream = new FileStream(logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+            _callEchoLogWriter = TextWriter.Synchronized(new StreamWriter(fileStream, new UTF8Encoding(false)) { AutoFlush = true });
+            _callEchoLogPath = logPath;
+            _callEchoLogWriter.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ===== session start =====");
+            Console.WriteLine($"[叫词日志] 独立日志文件: {logPath}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[叫词日志] 初始化失败: {ex.Message}");
+        }
+    }
+
+    private static void CloseCallEchoLog()
+    {
+        try
+        {
+            _callEchoLogWriter?.Flush();
+            _callEchoLogWriter?.Dispose();
+        }
+        catch
+        {
+            // ignored
+        }
+
+        _callEchoLogWriter = null;
+        _callEchoLogPath = null;
     }
 
     private static void CloseStartupLog()
@@ -7297,13 +7446,29 @@ UUID: {binding.BjdUuid}
     private static void LogCallEchoText(string channel, string? groupId, string? userId, string callText, string status)
     {
         var text = CompactLogText(callText, 200);
+        string line;
         if (string.Equals(channel, "group", StringComparison.OrdinalIgnoreCase))
         {
-            Console.WriteLine($"[叫词][群] group={groupId ?? string.Empty}, user={userId ?? string.Empty}, status={status}, text={text}");
-            return;
+            line = $"[叫词][群] group={groupId ?? string.Empty}, user={userId ?? string.Empty}, status={status}, text={text}";
+        }
+        else
+        {
+            line = $"[叫词][私聊] user={userId ?? string.Empty}, status={status}, text={text}";
         }
 
-        Console.WriteLine($"[叫词][私聊] user={userId ?? string.Empty}, status={status}, text={text}");
+        Console.WriteLine(line);
+        try
+        {
+            if (_callEchoLogWriter != null)
+            {
+                var ts = DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture);
+                _callEchoLogWriter.WriteLine($"[{ts}] {line}");
+            }
+        }
+        catch
+        {
+            // ignored
+        }
     }
 
     private static void LogBotTextSend(string channel, string targetId, string content)
