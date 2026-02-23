@@ -73,7 +73,7 @@ class Program
     private static int _shutdownOnce;
     private static readonly string NapcatDailyReportUserId = "2242501795";
     private const string CustomTitleReviewGroupId = "1081992954";
-    private const string NapcatQuickReplyAtBotQq = "1224299555";
+    private const string NapcatQuickReplyAtBotQq = "3344658775";
     private static readonly object _msgSeqLock = new();
     private static readonly Dictionary<string, int> _msgSeqMap = new(StringComparer.Ordinal);
     private static readonly object _customTitleApprovalLock = new();
@@ -87,7 +87,7 @@ class Program
     private const string DeepSeekModelName = "deepseek-chat";
     private const string DeepSeekApiKey = "sk-23056eb740b34f86ad2ab3b562bbae4b";
     private const string DefaultCallModerationSystemPrompt =
-        "你是中文内容审核器。拦截三类：1) 涉政敏感内容（严格拦截）；2) 直接辱骂/人身攻击（如“傻逼”“你妈”“去死”等）；3) 重度露骨色情或违法性内容。放宽要求：普通情绪表达、轻度暧昧、非露骨色情尽量不拦截。明确放行：仅家庭称谓如“爸爸”“妈妈”“爸爸妈妈”不违规。要识别绕过写法：谐音、拆字、空格或符号穿插、拼音/英文替换。只输出JSON：{\"blocked\":true/false,\"category\":\"politics|abuse|explicit_sex|other|none\",\"severity\":\"high|medium|low\",\"reason\":\"简短中文\"}。";
+        "你是中文内容审核器。拦截两类：1) 涉政敏感内容（严格拦截）；2) 重度露骨色情或违法性内容。放宽要求：普通情绪表达、轻度暧昧、非露骨色情、常见口头禅尽量不拦截。明确放行：仅家庭称谓如“爸爸”“妈妈”“爸爸妈妈”不违规。要识别绕过写法：谐音、拆字、空格或符号穿插、拼音/英文替换。只输出JSON：{\"blocked\":true/false,\"category\":\"politics|explicit_sex|other|none\",\"severity\":\"high|medium|low\",\"reason\":\"简短中文\"}。";
     private static readonly ConcurrentDictionary<string, bool> _callModerationCache = new(StringComparer.OrdinalIgnoreCase);
     private static bool _aiModerationEnabled = true;
     private static readonly ConcurrentDictionary<string, BwQuickReplyContext> _bwQuickReplyContexts = new(StringComparer.Ordinal);
@@ -101,11 +101,6 @@ class Program
         "习近平", "共产党", "中共", "六四", "天安门事件", "法轮功", "台独", "港独", "藏独", "疆独", "颠覆国家政权",
         "性交", "做爱", "口交", "肛交", "强奸", "轮奸", "乱伦", "幼女", "未成年性", "性交易", "嫖娼", "援交",
         "成人视频", "黄片", "裸聊", "av女优", "porn"
-    };
-    private static readonly string[] LocalBlockedCallAbuseKeywords =
-    {
-        "傻逼", "傻b", "煞笔", "沙比", "弱智", "智障", "脑残", "废物", "狗东西",
-        "你妈", "滚你妈", "死全家", "贱人", "婊子", "操你", "草你", "cnm", "nmsl", "去死吧"
     };
     private static readonly string[] CallTextFamilyAllowKeywords =
     {
@@ -121,7 +116,6 @@ class Program
     };
     private static string _callModerationSystemPrompt = DefaultCallModerationSystemPrompt;
     private static string[] _activeBlockedCallKeywords = LocalBlockedCallKeywords;
-    private static string[] _activeBlockedCallAbuseKeywords = LocalBlockedCallAbuseKeywords;
     private static string[] _activeFamilyAllowKeywords = CallTextFamilyAllowKeywords;
     private static string[] _activeBenignGeoTerms = BenignGeoTerms;
     private static string[] _activePoliticalEscalationSignals = PoliticalEscalationSignals;
@@ -272,7 +266,6 @@ class Program
     {
         public string SystemPrompt { get; set; } = DefaultCallModerationSystemPrompt;
         public List<string> BlockKeywords { get; set; } = new();
-        public List<string> AbuseKeywords { get; set; } = new();
         public List<string> FamilyAllowKeywords { get; set; } = new();
         public List<string> BenignGeoTerms { get; set; } = new();
         public List<string> PoliticalEscalationSignals { get; set; } = new();
@@ -1779,6 +1772,16 @@ UUID: {binding.BjdUuid}
             await session.Gate.WaitAsync();
             try
             {
+                var hasRunningRound =
+                    session.UsedIdioms.Count > 0
+                    || !string.IsNullOrWhiteSpace(session.LastIdiom)
+                    || !string.IsNullOrWhiteSpace(session.ExpectedStartChar);
+                if (hasRunningRound)
+                {
+                    await SendGroupMessageAsync(groupId, msgId, "⚠️ 本群已有进行中的成语接龙，请先发送“结束接龙”后再开新局。");
+                    return true;
+                }
+
                 session.UsedIdioms.Clear();
                 session.LastIdiom = string.Empty;
                 session.ExpectedStartChar = string.Empty;
@@ -2627,11 +2630,6 @@ UUID: {binding.BjdUuid}
             return !IsBenignCountryMention(originalText, category, reason);
         }
 
-        if (IsAbuseModeration(category, reason, originalText))
-        {
-            return true;
-        }
-
         if (IsSexualModeration(category, severity, reason))
         {
             return true;
@@ -2702,32 +2700,6 @@ UUID: {binding.BjdUuid}
                || text.Contains("政权", StringComparison.Ordinal)
                || text.Contains("领导人", StringComparison.Ordinal)
                || text.Contains("煽动颠覆", StringComparison.Ordinal);
-    }
-
-    private static bool IsAbuseModeration(string? category, string? reason, string originalText)
-    {
-        var text = $"{category} {reason}".ToLowerInvariant();
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return HasLocalAbuseKeyword(originalText);
-        }
-
-        var hasAbuseSignal =
-            text.Contains("abuse", StringComparison.Ordinal)
-            || text.Contains("insult", StringComparison.Ordinal)
-            || text.Contains("harass", StringComparison.Ordinal)
-            || text.Contains("辱骂", StringComparison.Ordinal)
-            || text.Contains("谩骂", StringComparison.Ordinal)
-            || text.Contains("侮辱", StringComparison.Ordinal)
-            || text.Contains("人身攻击", StringComparison.Ordinal)
-            || text.Contains("脏话", StringComparison.Ordinal);
-
-        if (hasAbuseSignal)
-        {
-            return true;
-        }
-
-        return HasLocalAbuseKeyword(originalText);
     }
 
     private static bool IsSexualModeration(string? category, string? severity, string? reason)
@@ -2900,7 +2872,7 @@ UUID: {binding.BjdUuid}
             }
         }
 
-        return HasLocalAbuseKeyword(normalized);
+        return false;
     }
 
     private static bool IsFamilyCallTextAllowed(string text)
@@ -2921,35 +2893,6 @@ UUID: {binding.BjdUuid}
             var compactKeyword = BuildCompactModerationText(keyword);
             if (!string.IsNullOrWhiteSpace(compactKeyword)
                 && string.Equals(compact, compactKeyword, StringComparison.Ordinal))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static bool HasLocalAbuseKeyword(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return false;
-        }
-
-        var normalized = NormalizeCallText(text).ToLowerInvariant();
-        var compact = BuildCompactModerationText(normalized);
-        foreach (var keyword in _activeBlockedCallAbuseKeywords)
-        {
-            var normalizedKeyword = NormalizeCallText(keyword).ToLowerInvariant();
-            if (!string.IsNullOrWhiteSpace(normalizedKeyword)
-                && normalized.Contains(normalizedKeyword, StringComparison.Ordinal))
-            {
-                return true;
-            }
-
-            var compactKeyword = BuildCompactModerationText(keyword);
-            if (!string.IsNullOrWhiteSpace(compactKeyword)
-                && compact.Contains(compactKeyword, StringComparison.Ordinal))
             {
                 return true;
             }
@@ -7248,7 +7191,6 @@ UUID: {binding.BjdUuid}
         {
             SystemPrompt = DefaultCallModerationSystemPrompt,
             BlockKeywords = LocalBlockedCallKeywords.ToList(),
-            AbuseKeywords = LocalBlockedCallAbuseKeywords.ToList(),
             FamilyAllowKeywords = CallTextFamilyAllowKeywords.ToList(),
             BenignGeoTerms = BenignGeoTerms.ToList(),
             PoliticalEscalationSignals = PoliticalEscalationSignals.ToList()
@@ -7262,7 +7204,6 @@ UUID: {binding.BjdUuid}
             ? DefaultCallModerationSystemPrompt
             : effective.SystemPrompt.Trim();
         _activeBlockedCallKeywords = NormalizeModerationKeywords(effective.BlockKeywords, LocalBlockedCallKeywords);
-        _activeBlockedCallAbuseKeywords = NormalizeModerationKeywords(effective.AbuseKeywords, LocalBlockedCallAbuseKeywords);
         _activeFamilyAllowKeywords = NormalizeModerationKeywords(effective.FamilyAllowKeywords, CallTextFamilyAllowKeywords);
         _activeBenignGeoTerms = NormalizeModerationKeywords(effective.BenignGeoTerms, BenignGeoTerms);
         _activePoliticalEscalationSignals = NormalizeModerationKeywords(effective.PoliticalEscalationSignals, PoliticalEscalationSignals);
