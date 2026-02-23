@@ -474,7 +474,7 @@ public sealed class BotDataStore
                 return false;
             }
 
-            message = $"NapCat 浠婃棩璋冪敤閲忕粺璁★紙{today}锛夛細{_usageCount}";
+            message = $"NapCat 今日调用量统计（{today}）：{_usageCount}";
             _lastReportedDate = today;
             PersistNapcatUsageUnsafe();
             return true;

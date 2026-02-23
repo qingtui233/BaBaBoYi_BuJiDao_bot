@@ -5,6 +5,8 @@ namespace BedwarsBot;
 public class HelpService
 {
     private IBrowser _browser;
+    private readonly SemaphoreSlim _cacheLock = new(1, 1);
+    private byte[]? _cachedHelpImageBytes;
     private static readonly string[] EdgeCandidatePaths =
     {
         @"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
@@ -68,6 +70,19 @@ public class HelpService
 
     public async Task<Stream> GenerateHelpImageAsync()
     {
+        if (_cachedHelpImageBytes is { Length: > 0 } cached)
+        {
+            return new MemoryStream(cached, writable: false);
+        }
+
+        await _cacheLock.WaitAsync();
+        try
+        {
+            if (_cachedHelpImageBytes is { Length: > 0 } lockedCached)
+            {
+                return new MemoryStream(lockedCached, writable: false);
+            }
+
         var html = GetHtmlTemplate();
 
         using var page = await _browser.NewPageAsync();
@@ -77,7 +92,16 @@ public class HelpService
         var body = await page.QuerySelectorAsync(".help-card");
         if (body == null) throw new Exception("帮助菜单渲染失败");
 
-        return await body.ScreenshotStreamAsync(new  ElementScreenshotOptions { OmitBackground = true });
+            using var screenshot = await body.ScreenshotStreamAsync(new ElementScreenshotOptions { OmitBackground = true });
+            using var memory = new MemoryStream();
+            await screenshot.CopyToAsync(memory);
+            _cachedHelpImageBytes = memory.ToArray();
+            return new MemoryStream(_cachedHelpImageBytes, writable: false);
+        }
+        finally
+        {
+            _cacheLock.Release();
+        }
     }
 
     public async Task CloseAsync()
@@ -104,6 +128,7 @@ public class HelpService
         }
 
         _browser = null!;
+        _cachedHelpImageBytes = null;
     }
 
     private static string GetHtmlTemplate()
@@ -420,7 +445,7 @@ public class HelpService
                                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><path d="M9.1 9a3 3 0 1 1 5.8 1c-.6 1.2-1.9 1.5-2.5 2.2-.2.2-.4.6-.4 1.1"></path><path d="M12 17h.01"></path></svg>
                                     </div>
                                     <div>
-                                        <div class="cmd-syntax">!help / 帮助</div>
+                                        <div class="cmd-syntax">!help / 帮助 / 菜单</div>
                                         <div class="cmd-desc">发送当前帮助菜单图片。</div>
                                     </div>
                                 </div>

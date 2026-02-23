@@ -89,12 +89,33 @@ class Program
     private static readonly ConcurrentDictionary<string, bool> _callModerationCache = new(StringComparer.OrdinalIgnoreCase);
     private static bool _aiModerationEnabled = true;
     private static readonly ConcurrentDictionary<string, BwQuickReplyContext> _bwQuickReplyContexts = new(StringComparer.Ordinal);
+    private static readonly object _bwQuickReplyContextFileLock = new();
+    private static string? _bwQuickReplyContextPath;
+    private static readonly object _runtimeStateFileLock = new();
+    private static string? _runtimeStatePath;
     private static readonly ConcurrentDictionary<string, IdiomChainSession> _idiomChainSessions = new(StringComparer.Ordinal);
     private static readonly string[] LocalBlockedCallKeywords =
     {
         "习近平", "共产党", "中共", "六四", "天安门事件", "法轮功", "台独", "港独", "藏独", "疆独", "颠覆国家政权",
         "性交", "做爱", "口交", "肛交", "强奸", "轮奸", "乱伦", "幼女", "未成年性", "性交易", "嫖娼", "援交", "约炮",
-        "成人视频", "黄片", "裸聊", "av女优", "porn"
+        "成人视频", "黄片", "裸聊", "av女优", "porn",
+        "性暗示", "性器官", "阴茎", "阴道", "乳房", "胸部", "下体", "龟头", "精液", "射精", "勃起", "呻吟", "开房", "湿了"
+    };
+    private static readonly string[] LocalBlockedCallVentingKeywords =
+    {
+        "发癫", "癫了", "崩溃", "我快疯了", "我要疯了", "受不了了", "毁灭吧", "不想活了", "活不下去", "想死", "气炸了", "炸了"
+    };
+    private static readonly string[] CallTextFamilyAllowKeywords =
+    {
+        "爸爸", "妈妈", "爸爸妈妈", "爸妈", "父母"
+    };
+    private static readonly string[] BenignGeoTerms =
+    {
+        "中国", "中华人民共和国"
+    };
+    private static readonly string[] PoliticalEscalationSignals =
+    {
+        "共产党", "中共", "台独", "港独", "藏独", "疆独", "颠覆", "政权", "领导人", "天安门", "六四", "法轮功", "煽动", "分裂"
     };
     private static readonly ConcurrentDictionary<string, ApiResultCacheEntry> _apiResultCache = new(StringComparer.OrdinalIgnoreCase);
     private static readonly TimeSpan GameStatsCacheTtl = TimeSpan.FromSeconds(30);
@@ -109,6 +130,14 @@ class Program
     private static readonly TimeSpan IdiomChainSessionTimeout = TimeSpan.FromMinutes(20);
     private const int IdiomChainMaxUsedCount = 300;
     private const int MsgSeqMapMaxEntries = 4096;
+    private const int GroupCallRateLimitPerMinute = 8;
+    private const int GroupCallRepeatedContentBlockThreshold = 3;
+    private static readonly TimeSpan GroupCallRateLimitWindow = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan GroupCallRateLimitStateTtl = TimeSpan.FromMinutes(15);
+    private static readonly object _groupCallRateLimitLock = new();
+    private static readonly Dictionary<string, GroupCallRateLimitState> _groupCallRateLimitStates = new(StringComparer.Ordinal);
+    private static readonly Regex RepeatedEmotionalCharRegex = new(@"([啊呀哇哈呜哦嗯])\1{5,}", RegexOptions.Compiled);
+    private static readonly Regex RepeatedEmotionPunctuationRegex = new(@"([!！?？~～])\1{5,}", RegexOptions.Compiled);
     private static long _lastApiCacheMaintenanceTicksUtc;
     private static readonly object _leaderboardUrlLock = new();
     private static string? _lastWorkingLeaderboardUrl;
@@ -175,6 +204,77 @@ class Program
     }
 
     private sealed record BwQuickReplyContext(string PlayerName, DateTimeOffset CreatedAtUtc);
+    private sealed class PersistedBwQuickReplyContext
+    {
+        public string Key { get; set; } = string.Empty;
+        public string PlayerName { get; set; } = string.Empty;
+        public DateTimeOffset CreatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
+    }
+
+    private sealed class PersistedPendingCustomTitleRequest
+    {
+        public string ReviewMessageId { get; set; } = string.Empty;
+        public string ApplicantQq { get; set; } = string.Empty;
+        public string ApplicantBjdName { get; set; } = string.Empty;
+        public string ApplicantBjdUuid { get; set; } = string.Empty;
+        public string Title { get; set; } = string.Empty;
+        public string ColorHex { get; set; } = "FFFFFF";
+        public DateTimeOffset CreatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
+    }
+
+    private sealed class PersistedPendingSkinAddRequest
+    {
+        public string ReviewMessageId { get; set; } = string.Empty;
+        public string ApplicantQq { get; set; } = string.Empty;
+        public string ApplicantBjdName { get; set; } = string.Empty;
+        public string ApplicantBjdUuid { get; set; } = string.Empty;
+        public string OfficialId { get; set; } = string.Empty;
+        public DateTimeOffset CreatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
+    }
+
+    private sealed class PersistedPendingPlayerIdFontSizeRequest
+    {
+        public string ReviewMessageId { get; set; } = string.Empty;
+        public string ApplicantQq { get; set; } = string.Empty;
+        public string ApplicantBjdName { get; set; } = string.Empty;
+        public int IdFontSize { get; set; }
+        public DateTimeOffset CreatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
+    }
+
+    private sealed class PersistedIdiomChainSession
+    {
+        public string GroupId { get; set; } = string.Empty;
+        public List<string> UsedIdioms { get; set; } = new();
+        public string LastIdiom { get; set; } = string.Empty;
+        public string ExpectedStartChar { get; set; } = string.Empty;
+        public DateTimeOffset LastUpdatedUtc { get; set; } = DateTimeOffset.UtcNow;
+    }
+
+    private sealed class RuntimeStateSnapshot
+    {
+        public List<PersistedPendingCustomTitleRequest> PendingCustomTitleRequests { get; set; } = new();
+        public List<PersistedPendingSkinAddRequest> PendingSkinAddRequests { get; set; } = new();
+        public List<PersistedPendingPlayerIdFontSizeRequest> PendingPlayerIdFontSizeRequests { get; set; } = new();
+        public string PendingUpdateText { get; set; } = string.Empty;
+        public List<string> PendingUpdateDeliveredUsers { get; set; } = new();
+        public List<PersistedIdiomChainSession> IdiomChainSessions { get; set; } = new();
+    }
+
+    private sealed class GroupCallRateLimitState
+    {
+        public Queue<DateTimeOffset> MessageTimesUtc { get; } = new();
+        public string LastContentKey { get; set; } = string.Empty;
+        public int LastContentStreak { get; set; }
+        public DateTimeOffset LastSeenUtc { get; set; } = DateTimeOffset.UtcNow;
+    }
+
+    private enum GroupCallLimitReason
+    {
+        None = 0,
+        TooFrequent = 1,
+        RepeatedContent = 2
+    }
+
     private sealed class IdiomChainSession
     {
         public SemaphoreSlim Gate { get; } = new(1, 1);
@@ -320,6 +420,10 @@ class Program
 
             _dataStore = new BotDataStore(rootDir);
             _dataStore.Initialize();
+            _runtimeStatePath = Path.Combine(_dataStore.ConfigDirectory, "runtime_state.json");
+            LoadRuntimeStateFromDisk();
+            _bwQuickReplyContextPath = Path.Combine(_dataStore.ConfigDirectory, "bw_quick_reply_contexts.json");
+            LoadBwQuickReplyContextsFromDisk();
             _bindService = new BindService(_dataStore);
             _infoPhotoService = new InfoPhotoService(_dataStore, _httpClient);
             _backgroundService = new BackGround(_dataStore, _httpClient);
@@ -397,7 +501,7 @@ class Program
                 _napcatBot.OnPrivateMessage += HandleNapcatPrivateMessageAsync;
                 await _napcatBot.StartAsync();
                 _ = Task.Run(() => RunNapcatDailyUsageReporterAsync(exitCts.Token));
-                Console.WriteLine(">>> NapCat 机器人已就绪！可用指令: !bw <ID> [模式] / !bw <ID> <x年x月x日> / !sw <ID> / !lb <ID> / !sess bw [玩家名] [t天数] / /喊话 [几月几日几点几分] / !bind <布吉岛名> / !skin add <正版ID> / /skin up / !bg / !bg set <透明度> / !bg icon <像素> / !bg id <像素> / !bg cl <颜色ID> / !help / /群发 / /群发编辑 <文本> / 成语接龙 [开局成语] / 结束接龙 / 接龙提示");
+                Console.WriteLine(">>> NapCat 机器人已就绪！可用指令: !bw <ID> [模式] / !bw <ID> <x年x月x日> / !sw <ID> / !lb <ID> / !sess bw [玩家名] [t天数] / /喊话 [几月几日几点几分] / !bind <布吉岛名> / !skin add <正版ID> / /skin up / !bg / !bg set <透明度> / !bg icon <像素> / !bg id <像素> / !bg cl <颜色ID> / !help / 菜单 / /群发 / /群发编辑 <文本> / 成语接龙 [开局成语] / 结束接龙 / 接龙提示");
             }
 
             if (enableOfficial)
@@ -409,12 +513,12 @@ class Program
                 {
                     await _qqBot.StartHttpOnlyAsync();
                     await StartAspNetWebhookHostAsync(botConfig, exitCts.Token);
-                    Console.WriteLine(">>> 官方机器人(Webhook)已就绪！（群内必须 @机器人 触发）可用指令: !bw <ID> [模式] / !bw <ID> <x年x月x日> / !sw <ID> / !lb <ID> / !sess bw [玩家名] [t天数] / /喊话 [几月几日几点几分] / !bind <布吉岛名> / !skin add <正版ID> / /skin up / !bg / !bg set <透明度> / !bg icon <像素> / !bg id <像素> / !bg cl <颜色ID> / !help");
+                    Console.WriteLine(">>> 官方机器人(Webhook)已就绪！（群内必须 @机器人 触发）可用指令: !bw <ID> [模式] / !bw <ID> <x年x月x日> / !sw <ID> / !lb <ID> / !sess bw [玩家名] [t天数] / /喊话 [几月几日几点几分] / !bind <布吉岛名> / !skin add <正版ID> / /skin up / !bg / !bg set <透明度> / !bg icon <像素> / !bg id <像素> / !bg cl <颜色ID> / !help / 菜单");
                 }
                 else
                 {
                     await _qqBot.StartAsync();
-                    Console.WriteLine(">>> 官方机器人已就绪！（群内必须 @机器人 触发）可用指令: !bw <ID> [模式] / !bw <ID> <x年x月x日> / !sw <ID> / !lb <ID> / !sess bw [玩家名] [t天数] / /喊话 [几月几日几点几分] / !bind <布吉岛名> / !skin add <正版ID> / /skin up / !bg / !bg set <透明度> / !bg icon <像素> / !bg id <像素> / !bg cl <颜色ID> / !help");
+                    Console.WriteLine(">>> 官方机器人已就绪！（群内必须 @机器人 触发）可用指令: !bw <ID> [模式] / !bw <ID> <x年x月x日> / !sw <ID> / !lb <ID> / !sess bw [玩家名] [t天数] / /喊话 [几月几日几点几分] / !bind <布吉岛名> / !skin add <正版ID> / /skin up / !bg / !bg set <透明度> / !bg icon <像素> / !bg id <像素> / !bg cl <颜色ID> / !help / 菜单");
                 }
             }
 
@@ -695,7 +799,7 @@ class Program
                 return;
             }
 
-            if (cmd == "help" || cmd == "帮助")
+            if (cmd == "help" || cmd == "帮助" || cmd == "菜单")
             {
                 await HandleHelpCommandAsync(groupId, msgId);
             }
@@ -942,7 +1046,7 @@ class Program
                 return;
             }
 
-            if (cmd == "help" || cmd == "帮助")
+            if (cmd == "help" || cmd == "帮助" || cmd == "菜单")
             {
                 await HandleHelpCommandAsync(groupId, msgId);
             }
@@ -1056,7 +1160,7 @@ class Program
                 return;
             }
 
-            if (cmd == "help" || cmd == "帮助")
+            if (cmd == "help" || cmd == "帮助" || cmd == "菜单")
             {
                 await HandleHelpPrivateCommandAsync(userId);
                 return;
@@ -1163,6 +1267,7 @@ UUID: {binding.BjdUuid}
                     };
                 }
 
+                PersistRuntimeStateToDisk();
                 await SendGroupMessageAsync(groupId, safeMsgId, "✅ 已提交皮肤绑定申请，等待管理员在本群发送“同意”通过。");
                 return;
             }
@@ -1472,9 +1577,23 @@ UUID: {binding.BjdUuid}
             return false;
         }
 
-        if (await IsCallTextBlockedAsync(callText))
+        var limitReason = CheckGroupCallLimit(groupId, callText);
+        if (limitReason != GroupCallLimitReason.None)
         {
-            await SendGroupMessageAsync(groupId, msgId, "deepseek检测到违规词");
+            var status = limitReason == GroupCallLimitReason.TooFrequent ? "rate_limited" : "repeat_limited";
+            LogCallEchoText("group", groupId, userId, callText, status);
+            var tip = limitReason == GroupCallLimitReason.TooFrequent
+                ? "发送过于频繁，请稍后再试。"
+                : "该内容无法显示";
+            await SendGroupMessageAsync(groupId, msgId, tip);
+            return true;
+        }
+
+        var blocked = await IsCallTextBlockedAsync(callText);
+        LogCallEchoText("group", groupId, userId, callText, blocked ? "moderation_blocked" : "allowed");
+        if (blocked)
+        {
+            await SendGroupMessageAsync(groupId, msgId, "该内容无法显示");
             return true;
         }
 
@@ -1489,14 +1608,104 @@ UUID: {binding.BjdUuid}
             return false;
         }
 
-        if (await IsCallTextBlockedAsync(callText))
+        var blocked = await IsCallTextBlockedAsync(callText);
+        LogCallEchoText("private", null, userId, callText, blocked ? "moderation_blocked" : "allowed");
+        if (blocked)
         {
-            await SendPrivateMessageAsync(userId, "deepseek检测到违规词");
+            await SendPrivateMessageAsync(userId, "该内容无法显示");
             return true;
         }
 
         await SendPrivateMessageAsync(userId, callText);
         return true;
+    }
+
+    private static GroupCallLimitReason CheckGroupCallLimit(string groupId, string callText)
+    {
+        if (string.IsNullOrWhiteSpace(groupId))
+        {
+            return GroupCallLimitReason.None;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var contentKey = BuildCompactModerationText(callText);
+        if (string.IsNullOrWhiteSpace(contentKey))
+        {
+            contentKey = NormalizeCallText(callText).ToLowerInvariant();
+        }
+
+        lock (_groupCallRateLimitLock)
+        {
+            if (!_groupCallRateLimitStates.TryGetValue(groupId, out var state))
+            {
+                state = new GroupCallRateLimitState();
+                _groupCallRateLimitStates[groupId] = state;
+            }
+
+            state.LastSeenUtc = now;
+            var windowStart = now - GroupCallRateLimitWindow;
+            while (state.MessageTimesUtc.Count > 0 && state.MessageTimesUtc.Peek() < windowStart)
+            {
+                state.MessageTimesUtc.Dequeue();
+            }
+
+            state.MessageTimesUtc.Enqueue(now);
+
+            if (string.Equals(state.LastContentKey, contentKey, StringComparison.Ordinal))
+            {
+                state.LastContentStreak++;
+            }
+            else
+            {
+                state.LastContentKey = contentKey;
+                state.LastContentStreak = 1;
+            }
+
+            TrimGroupCallRateLimitStatesUnsafe(now);
+
+            if (state.LastContentStreak >= GroupCallRepeatedContentBlockThreshold)
+            {
+                return GroupCallLimitReason.RepeatedContent;
+            }
+
+            if (state.MessageTimesUtc.Count > GroupCallRateLimitPerMinute)
+            {
+                return GroupCallLimitReason.TooFrequent;
+            }
+
+            return GroupCallLimitReason.None;
+        }
+    }
+
+    private static void TrimGroupCallRateLimitStatesUnsafe(DateTimeOffset now)
+    {
+        if (_groupCallRateLimitStates.Count == 0)
+        {
+            return;
+        }
+
+        var staleBefore = now - GroupCallRateLimitStateTtl;
+        List<string>? staleKeys = null;
+        foreach (var pair in _groupCallRateLimitStates)
+        {
+            if (pair.Value.LastSeenUtc >= staleBefore)
+            {
+                continue;
+            }
+
+            staleKeys ??= new List<string>();
+            staleKeys.Add(pair.Key);
+        }
+
+        if (staleKeys == null || staleKeys.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var key in staleKeys)
+        {
+            _groupCallRateLimitStates.Remove(key);
+        }
     }
 
     private sealed record IdiomRoundResult(bool Valid, string Normalized, string Next, string Reason);
@@ -1531,6 +1740,7 @@ UUID: {binding.BjdUuid}
             {
                 var usedCount = session.UsedIdioms.Count;
                 _idiomChainSessions.TryRemove(groupId, out _);
+                PersistRuntimeStateToDisk();
                 _dataStore.IncrementNapcatUsage();
                 await SendGroupMessageAsync(groupId, msgId, $"✅ 已结束本群成语接龙，共记录 {usedCount} 个成语。");
             }
@@ -1552,6 +1762,7 @@ UUID: {binding.BjdUuid}
                 session.LastIdiom = string.Empty;
                 session.ExpectedStartChar = string.Empty;
                 session.LastUpdatedUtc = DateTimeOffset.UtcNow;
+                PersistRuntimeStateToDisk();
 
                 if (string.IsNullOrWhiteSpace(openingIdiomRaw))
                 {
@@ -1567,6 +1778,7 @@ UUID: {binding.BjdUuid}
                     session.LastIdiom = firstIdiom;
                     session.ExpectedStartChar = GetLastChineseChar(firstIdiom);
                     session.LastUpdatedUtc = DateTimeOffset.UtcNow;
+                    PersistRuntimeStateToDisk();
                     _dataStore.IncrementNapcatUsage();
 
                     await SendGroupMessageAsync(
@@ -1608,6 +1820,7 @@ UUID: {binding.BjdUuid}
                 if (string.IsNullOrWhiteSpace(round.Next))
                 {
                     _idiomChainSessions.TryRemove(groupId, out _);
+                    PersistRuntimeStateToDisk();
                     _dataStore.IncrementNapcatUsage();
                     await SendGroupMessageAsync(
                         groupId,
@@ -1619,6 +1832,7 @@ UUID: {binding.BjdUuid}
                 session.LastIdiom = round.Next;
                 session.ExpectedStartChar = GetLastChineseChar(round.Next);
                 session.LastUpdatedUtc = DateTimeOffset.UtcNow;
+                PersistRuntimeStateToDisk();
                 _dataStore.IncrementNapcatUsage();
 
                 await SendGroupMessageAsync(
@@ -1679,6 +1893,7 @@ UUID: {binding.BjdUuid}
             if (DateTimeOffset.UtcNow - session.LastUpdatedUtc > IdiomChainSessionTimeout)
             {
                 _idiomChainSessions.TryRemove(groupId, out _);
+                PersistRuntimeStateToDisk();
                 await SendGroupMessageAsync(groupId, msgId, "⌛ 这局成语接龙已超时结束。发送“成语接龙”可重新开始。");
                 return true;
             }
@@ -1725,6 +1940,7 @@ UUID: {binding.BjdUuid}
             if (string.IsNullOrWhiteSpace(roundResult.Next))
             {
                 _idiomChainSessions.TryRemove(groupId, out _);
+                PersistRuntimeStateToDisk();
                 _dataStore.IncrementNapcatUsage();
                 await SendGroupMessageAsync(
                     groupId,
@@ -1736,6 +1952,7 @@ UUID: {binding.BjdUuid}
             session.LastIdiom = roundResult.Next;
             session.ExpectedStartChar = GetLastChineseChar(roundResult.Next);
             session.LastUpdatedUtc = DateTimeOffset.UtcNow;
+            PersistRuntimeStateToDisk();
             _dataStore.IncrementNapcatUsage();
             await SendGroupMessageAsync(
                 groupId,
@@ -1760,6 +1977,7 @@ UUID: {binding.BjdUuid}
         if (DateTimeOffset.UtcNow - existing.LastUpdatedUtc > IdiomChainSessionTimeout)
         {
             _idiomChainSessions.TryRemove(groupId, out _);
+            PersistRuntimeStateToDisk();
             return false;
         }
 
@@ -2203,7 +2421,64 @@ UUID: {binding.BjdUuid}
             return string.Empty;
         }
 
-        return text.Replace('\u3000', ' ').Trim();
+        var normalized = text.Normalize(NormalizationForm.FormKC).Replace('\u3000', ' ');
+        var sb = new StringBuilder(normalized.Length);
+        foreach (var ch in normalized)
+        {
+            if (ch is '\u200B' or '\u200C' or '\u200D' or '\u2060' or '\uFEFF')
+            {
+                continue;
+            }
+
+            sb.Append(ch);
+        }
+
+        return sb.ToString().Trim();
+    }
+
+    private static string BuildCompactModerationText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        var normalized = NormalizeCallText(text);
+        var sb = new StringBuilder(normalized.Length);
+        foreach (var ch in normalized)
+        {
+            if (char.IsWhiteSpace(ch))
+            {
+                continue;
+            }
+
+            var category = CharUnicodeInfo.GetUnicodeCategory(ch);
+            var isSeparator =
+                category is UnicodeCategory.Control
+                    or UnicodeCategory.Format
+                    or UnicodeCategory.SpaceSeparator
+                    or UnicodeCategory.LineSeparator
+                    or UnicodeCategory.ParagraphSeparator
+                    or UnicodeCategory.ConnectorPunctuation
+                    or UnicodeCategory.DashPunctuation
+                    or UnicodeCategory.OpenPunctuation
+                    or UnicodeCategory.ClosePunctuation
+                    or UnicodeCategory.InitialQuotePunctuation
+                    or UnicodeCategory.FinalQuotePunctuation
+                    or UnicodeCategory.OtherPunctuation
+                    or UnicodeCategory.MathSymbol
+                    or UnicodeCategory.CurrencySymbol
+                    or UnicodeCategory.ModifierSymbol
+                    or UnicodeCategory.OtherSymbol;
+            if (isSeparator)
+            {
+                continue;
+            }
+
+            sb.Append(char.ToLowerInvariant(ch));
+        }
+
+        return sb.ToString();
     }
 
     private static async Task<bool> IsCallTextBlockedAsync(string text)
@@ -2214,7 +2489,14 @@ UUID: {binding.BjdUuid}
             return false;
         }
 
-        if (_callModerationCache.TryGetValue(normalized, out var cached))
+        if (IsFamilyCallTextAllowed(normalized))
+        {
+            return false;
+        }
+
+        var compact = BuildCompactModerationText(normalized);
+        var cacheKey = string.IsNullOrWhiteSpace(compact) ? normalized : $"{normalized}||{compact}";
+        if (_callModerationCache.TryGetValue(cacheKey, out var cached))
         {
             return cached;
         }
@@ -2222,19 +2504,19 @@ UUID: {binding.BjdUuid}
         bool blocked;
         if (_aiModerationEnabled)
         {
-            blocked = await RequestDeepSeekCallModerationAsync(normalized);
+            blocked = await RequestDeepSeekCallModerationAsync(normalized, compact);
         }
         else
         {
             blocked = HasLocalBlockedKeyword(normalized);
         }
 
-        _callModerationCache[normalized] = blocked;
+        _callModerationCache[cacheKey] = blocked;
         TrimCallModerationCacheIfNeeded();
         return blocked;
     }
 
-    private static async Task<bool> RequestDeepSeekCallModerationAsync(string text)
+    private static async Task<bool> RequestDeepSeekCallModerationAsync(string text, string compactText)
     {
         try
         {
@@ -2247,12 +2529,12 @@ UUID: {binding.BjdUuid}
                     new
                     {
                         role = "system",
-                        content = "你是中文内容审核器。只审核两类：1) 政治敏感/涉政煽动；2) 重度露骨色情（含性交易、未成年人性内容）。普通骂人、脏话、侮辱、轻度擦边、暧昧或玩笑都判定为不违规。只输出JSON：{\"blocked\":true/false,\"category\":\"politics|explicit_sex|other|none\",\"severity\":\"high|medium|low\",\"reason\":\"简短中文\"}。仅当category为politics或explicit_sex且severity不是low时，blocked=true。"
+                        content = "你是中文内容审核器。拦截三类：1) 政治相关敏感/涉政词汇；2) 任何性暗示、性器官描述、色情擦边或露骨性内容；3) 发泄类/发癫文（大量情绪宣泄、崩溃式表达），即使不含辱骂也算违规。明确放行：仅家庭称谓如“爸爸”“妈妈”“爸爸妈妈”不违规。要识别绕过写法：谐音、拆字、空格或符号穿插、拼音/英文替换。只输出JSON：{\"blocked\":true/false,\"category\":\"politics|sexual|venting|other|none\",\"severity\":\"high|medium|low\",\"reason\":\"简短中文\"}。"
                     },
                     new
                     {
                         role = "user",
-                        content = $"请按上述规则审核：{text}"
+                        content = $"请按上述规则审核。\n原文：{text}\n规整文本：{compactText}\n请识别可能的谐音/变体绕过。"
                     }
                 }
             };
@@ -2271,6 +2553,11 @@ UUID: {binding.BjdUuid}
 
             var root = JObject.Parse(content);
             var raw = root.SelectToken("choices[0].message.content")?.ToString() ?? string.Empty;
+            if (ContainsDeepSeekViolationHint(raw))
+            {
+                return ShouldBlockByDeepSeekResult(true, "other", "medium", raw, text);
+            }
+
             var jsonText = ExtractJsonObject(raw);
             if (string.IsNullOrWhiteSpace(jsonText))
             {
@@ -2290,10 +2577,10 @@ UUID: {binding.BjdUuid}
                          ?? obj["原因"]?.ToString();
             if (blockedToken != null && TryParseBoolToken(blockedToken, out var blocked))
             {
-                return ShouldBlockByDeepSeekResult(blocked, category, severity, reason);
+                return ShouldBlockByDeepSeekResult(blocked, category, severity, reason, text);
             }
 
-            if (ShouldBlockByDeepSeekResult(true, category, severity, reason))
+            if (ShouldBlockByDeepSeekResult(true, category, severity, reason, text))
             {
                 return true;
             }
@@ -2307,14 +2594,77 @@ UUID: {binding.BjdUuid}
         }
     }
 
-    private static bool ShouldBlockByDeepSeekResult(bool blocked, string? category, string? severity, string? reason)
+    private static bool ShouldBlockByDeepSeekResult(bool blocked, string? category, string? severity, string? reason, string originalText)
     {
-        if (!blocked)
+        if (IsFamilyCallTextAllowed(originalText))
         {
             return false;
         }
 
-        return IsPoliticsModeration(category, reason) || IsExplicitSexModeration(category, severity, reason);
+        if (IsPoliticsModeration(category, reason))
+        {
+            return !IsBenignCountryMention(originalText, category, reason);
+        }
+
+        if (IsSexualModeration(category, severity, reason, originalText))
+        {
+            return true;
+        }
+
+        if (IsVentingModeration(category, reason, originalText))
+        {
+            return true;
+        }
+
+        return blocked;
+    }
+
+    private static bool IsBenignCountryMention(string originalText, string? category, string? reason)
+    {
+        var text = $"{originalText} {category} {reason}";
+        var normalized = NormalizeCallText(text);
+        var compact = BuildCompactModerationText(normalized);
+        if (string.IsNullOrWhiteSpace(compact))
+        {
+            return false;
+        }
+
+        var hasGeoTerm = false;
+        foreach (var term in BenignGeoTerms)
+        {
+            var termCompact = BuildCompactModerationText(term);
+            if (string.IsNullOrWhiteSpace(termCompact))
+            {
+                continue;
+            }
+
+            if (compact.Contains(termCompact, StringComparison.Ordinal))
+            {
+                hasGeoTerm = true;
+                break;
+            }
+        }
+
+        if (!hasGeoTerm)
+        {
+            return false;
+        }
+
+        foreach (var signal in PoliticalEscalationSignals)
+        {
+            var signalCompact = BuildCompactModerationText(signal);
+            if (string.IsNullOrWhiteSpace(signalCompact))
+            {
+                continue;
+            }
+
+            if (compact.Contains(signalCompact, StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool IsPoliticsModeration(string? category, string? reason)
@@ -2333,23 +2683,20 @@ UUID: {binding.BjdUuid}
                || text.Contains("煽动颠覆", StringComparison.Ordinal);
     }
 
-    private static bool IsExplicitSexModeration(string? category, string? severity, string? reason)
+    private static bool IsSexualModeration(string? category, string? severity, string? reason, string originalText)
     {
-        var text = $"{category} {reason}".ToLowerInvariant();
+        var text = $"{category} {severity} {reason}".ToLowerInvariant();
         if (string.IsNullOrWhiteSpace(text))
         {
-            return false;
+            return HasLocalBlockedKeyword(originalText);
         }
 
-        var severityText = (severity ?? string.Empty).Trim().ToLowerInvariant();
-        var isLowSeverity = severityText is "low" or "mild" or "轻度" or "一般";
-        if (isLowSeverity)
-        {
-            return false;
-        }
-
-        var hasHardSexSignal =
-            text.Contains("explicit_sex", StringComparison.Ordinal)
+        var hasSexSignal =
+            text.Contains("sexual", StringComparison.Ordinal)
+            || text.Contains("sex", StringComparison.Ordinal)
+            || text.Contains("性暗示", StringComparison.Ordinal)
+            || text.Contains("性器官", StringComparison.Ordinal)
+            || text.Contains("擦边", StringComparison.Ordinal)
             || text.Contains("露骨", StringComparison.Ordinal)
             || text.Contains("淫秽", StringComparison.Ordinal)
             || text.Contains("性交易", StringComparison.Ordinal)
@@ -2364,7 +2711,67 @@ UUID: {binding.BjdUuid}
             || text.Contains("援交", StringComparison.Ordinal)
             || text.Contains("裸聊", StringComparison.Ordinal);
 
-        return hasHardSexSignal;
+        if (hasSexSignal)
+        {
+            return true;
+        }
+
+        return HasLocalBlockedKeyword(originalText);
+    }
+
+    private static bool IsVentingModeration(string? category, string? reason, string originalText)
+    {
+        var text = $"{category} {reason}".ToLowerInvariant();
+        if (text.Contains("vent", StringComparison.Ordinal)
+            || text.Contains("发泄", StringComparison.Ordinal)
+            || text.Contains("发癫", StringComparison.Ordinal)
+            || text.Contains("崩溃", StringComparison.Ordinal)
+            || text.Contains("情绪宣泄", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return HasLocalVentingPattern(originalText);
+    }
+
+    private static bool ContainsDeepSeekViolationHint(string rawResponse)
+    {
+        if (string.IsNullOrWhiteSpace(rawResponse))
+        {
+            return false;
+        }
+
+        var rawLower = rawResponse.ToLowerInvariant();
+        if (rawLower.Contains("\"blocked\":false", StringComparison.Ordinal)
+            || rawLower.Contains("\"blocked\" : false", StringComparison.Ordinal)
+            || rawLower.Contains("\"violation\":false", StringComparison.Ordinal)
+            || rawLower.Contains("\"violation\" : false", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (rawLower.Contains("\"blocked\":true", StringComparison.Ordinal)
+            || rawLower.Contains("\"blocked\" : true", StringComparison.Ordinal)
+            || rawLower.Contains("\"violation\":true", StringComparison.Ordinal)
+            || rawLower.Contains("\"violation\" : true", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        var normalized = NormalizeCallText(rawResponse).ToLowerInvariant();
+        if (normalized.Contains("不违规", StringComparison.Ordinal)
+            || normalized.Contains("未违规", StringComparison.Ordinal)
+            || normalized.Contains("未检测到违规", StringComparison.Ordinal)
+            || normalized.Contains("未发现违规", StringComparison.Ordinal)
+            || normalized.Contains("无违规", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return normalized.Contains("检测到违规", StringComparison.Ordinal)
+               || normalized.Contains("违规", StringComparison.Ordinal)
+               || normalized.Contains("violation", StringComparison.Ordinal)
+               || normalized.Contains("blocked", StringComparison.Ordinal);
     }
 
     private static bool TryParseBoolToken(JToken token, out bool value)
@@ -2437,13 +2844,97 @@ UUID: {binding.BjdUuid}
             return false;
         }
 
-        var normalized = text.ToLowerInvariant();
+        if (IsFamilyCallTextAllowed(text))
+        {
+            return false;
+        }
+
+        var normalized = NormalizeCallText(text).ToLowerInvariant();
+        var compact = BuildCompactModerationText(normalized);
         foreach (var keyword in LocalBlockedCallKeywords)
         {
-            if (normalized.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+            var normalizedKeyword = NormalizeCallText(keyword).ToLowerInvariant();
+            if (!string.IsNullOrWhiteSpace(normalizedKeyword)
+                && normalized.Contains(normalizedKeyword, StringComparison.Ordinal))
             {
                 return true;
             }
+
+            var compactKeyword = BuildCompactModerationText(keyword);
+            if (!string.IsNullOrWhiteSpace(compactKeyword)
+                && compact.Contains(compactKeyword, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        foreach (var keyword in LocalBlockedCallVentingKeywords)
+        {
+            var normalizedKeyword = NormalizeCallText(keyword).ToLowerInvariant();
+            if (!string.IsNullOrWhiteSpace(normalizedKeyword)
+                && normalized.Contains(normalizedKeyword, StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            var compactKeyword = BuildCompactModerationText(keyword);
+            if (!string.IsNullOrWhiteSpace(compactKeyword)
+                && compact.Contains(compactKeyword, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        if (HasLocalVentingPattern(normalized))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsFamilyCallTextAllowed(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var compact = BuildCompactModerationText(text);
+        if (string.IsNullOrWhiteSpace(compact))
+        {
+            return false;
+        }
+
+        foreach (var keyword in CallTextFamilyAllowKeywords)
+        {
+            var compactKeyword = BuildCompactModerationText(keyword);
+            if (!string.IsNullOrWhiteSpace(compactKeyword)
+                && string.Equals(compact, compactKeyword, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool HasLocalVentingPattern(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var normalized = NormalizeCallText(text).ToLowerInvariant();
+        if (RepeatedEmotionalCharRegex.IsMatch(normalized))
+        {
+            return true;
+        }
+
+        if (RepeatedEmotionPunctuationRegex.IsMatch(normalized))
+        {
+            return true;
         }
 
         return false;
@@ -2548,6 +3039,7 @@ UUID: {binding.BjdUuid}
             };
         }
 
+        PersistRuntimeStateToDisk();
         await SendGroupMessageAsync(groupId, msgId, "✅ 已提交称号申请，等待管理员在本群发送“同意”通过。");
     }
 
@@ -2669,6 +3161,7 @@ UUID: {binding.BjdUuid}
                     };
                 }
 
+                PersistRuntimeStateToDisk();
                 await SendGroupMessageAsync(groupId, msgId, "✅ 已提交ID字号申请，等待管理员在本群发送“同意”通过。");
                 return;
             }
@@ -3650,6 +4143,7 @@ UUID: {binding.BjdUuid}
                     $"✅ 你的称号申请已通过：{customTitleRequest.Title} (#{customTitleRequest.ColorHex})");
             }
 
+            PersistRuntimeStateToDisk();
             return true;
         }
 
@@ -3683,6 +4177,7 @@ UUID: {binding.BjdUuid}
                 }
             }
 
+            PersistRuntimeStateToDisk();
             return true;
         }
 
@@ -3698,6 +4193,7 @@ UUID: {binding.BjdUuid}
                     $"✅ 你的ID字号申请已通过：{playerIdFontSizeRequest.IdFontSize}px");
             }
 
+            PersistRuntimeStateToDisk();
             return true;
         }
 
@@ -3805,20 +4301,35 @@ UUID: {binding.BjdUuid}
     private static bool TryGetBwQuickReplyPlayer(string groupId, string replyMessageId, out string playerName)
     {
         playerName = string.Empty;
-        TrimBwQuickReplyContextsIfNeeded();
+        var hasChanges = TrimBwQuickReplyContextsIfNeeded();
 
         var key = BuildBwQuickReplyKey(groupId, replyMessageId);
         if (!_bwQuickReplyContexts.TryGetValue(key, out var ctx))
         {
+            if (hasChanges)
+            {
+                PersistBwQuickReplyContextsToDisk();
+            }
             return false;
         }
 
         if (DateTimeOffset.UtcNow - ctx.CreatedAtUtc > BwQuickReplyContextTtl)
         {
-            _bwQuickReplyContexts.TryRemove(key, out _);
+            if (_bwQuickReplyContexts.TryRemove(key, out _))
+            {
+                hasChanges = true;
+            }
+            if (hasChanges)
+            {
+                PersistBwQuickReplyContextsToDisk();
+            }
             return false;
         }
 
+        if (hasChanges)
+        {
+            PersistBwQuickReplyContextsToDisk();
+        }
         playerName = ctx.PlayerName;
         return !string.IsNullOrWhiteSpace(playerName);
     }
@@ -3831,7 +4342,7 @@ UUID: {binding.BjdUuid}
             return false;
         }
 
-        TrimBwQuickReplyContextsIfNeeded();
+        var hasChanges = TrimBwQuickReplyContextsIfNeeded();
         var prefix = $"{groupId}:";
         var now = DateTimeOffset.UtcNow;
         BwQuickReplyContext? best = null;
@@ -3845,7 +4356,10 @@ UUID: {binding.BjdUuid}
 
             if (now - kv.Value.CreatedAtUtc > BwQuickReplyContextTtl)
             {
-                _bwQuickReplyContexts.TryRemove(kv.Key, out _);
+                if (_bwQuickReplyContexts.TryRemove(kv.Key, out _))
+                {
+                    hasChanges = true;
+                }
                 continue;
             }
 
@@ -3857,9 +4371,17 @@ UUID: {binding.BjdUuid}
 
         if (best == null || string.IsNullOrWhiteSpace(best.PlayerName))
         {
+            if (hasChanges)
+            {
+                PersistBwQuickReplyContextsToDisk();
+            }
             return false;
         }
 
+        if (hasChanges)
+        {
+            PersistBwQuickReplyContextsToDisk();
+        }
         playerName = best.PlayerName;
         return true;
     }
@@ -3876,6 +4398,7 @@ UUID: {binding.BjdUuid}
         var key = BuildBwQuickReplyKey(groupId, messageId);
         _bwQuickReplyContexts[key] = new BwQuickReplyContext(playerName.Trim(), DateTimeOffset.UtcNow);
         TrimBwQuickReplyContextsIfNeeded();
+        PersistBwQuickReplyContextsToDisk();
     }
 
     private static string BuildBwQuickReplyKey(string groupId, string messageId)
@@ -3883,26 +4406,30 @@ UUID: {binding.BjdUuid}
         return $"{groupId}:{messageId}";
     }
 
-    private static void TrimBwQuickReplyContextsIfNeeded()
+    private static bool TrimBwQuickReplyContextsIfNeeded()
     {
         if (_bwQuickReplyContexts.IsEmpty)
         {
-            return;
+            return false;
         }
 
+        var hasChanges = false;
         var now = DateTimeOffset.UtcNow;
         foreach (var kv in _bwQuickReplyContexts)
         {
             if (now - kv.Value.CreatedAtUtc > BwQuickReplyContextTtl)
             {
-                _bwQuickReplyContexts.TryRemove(kv.Key, out _);
+                if (_bwQuickReplyContexts.TryRemove(kv.Key, out _))
+                {
+                    hasChanges = true;
+                }
             }
         }
 
         var count = _bwQuickReplyContexts.Count;
         if (count <= BwQuickReplyContextMaxEntries)
         {
-            return;
+            return hasChanges;
         }
 
         var removeCount = count - BwQuickReplyContextMaxEntries;
@@ -3912,7 +4439,402 @@ UUID: {binding.BjdUuid}
                      .Select(x => x.Key)
                      .ToList())
         {
-            _bwQuickReplyContexts.TryRemove(key, out _);
+            if (_bwQuickReplyContexts.TryRemove(key, out _))
+            {
+                hasChanges = true;
+            }
+        }
+
+        return hasChanges;
+    }
+
+    private static void LoadBwQuickReplyContextsFromDisk()
+    {
+        var path = _bwQuickReplyContextPath;
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return;
+        }
+
+        try
+        {
+            List<PersistedBwQuickReplyContext>? persisted;
+            lock (_bwQuickReplyContextFileLock)
+            {
+                var json = File.ReadAllText(path, Encoding.UTF8);
+                persisted = JsonConvert.DeserializeObject<List<PersistedBwQuickReplyContext>>(json);
+            }
+
+            if (persisted == null || persisted.Count == 0)
+            {
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            var restored = 0;
+            foreach (var item in persisted)
+            {
+                if (item == null
+                    || string.IsNullOrWhiteSpace(item.Key)
+                    || string.IsNullOrWhiteSpace(item.PlayerName))
+                {
+                    continue;
+                }
+
+                if (now - item.CreatedAtUtc > BwQuickReplyContextTtl)
+                {
+                    continue;
+                }
+
+                _bwQuickReplyContexts[item.Key.Trim()] =
+                    new BwQuickReplyContext(item.PlayerName.Trim(), item.CreatedAtUtc);
+                restored++;
+            }
+
+            var trimmed = TrimBwQuickReplyContextsIfNeeded();
+            if (trimmed || restored != persisted.Count)
+            {
+                PersistBwQuickReplyContextsToDisk();
+            }
+
+            if (restored > 0)
+            {
+                Console.WriteLine($"[快捷回复] 已恢复 {restored} 条战绩卡回复上下文。");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[快捷回复] 回复上下文恢复失败: {ex.Message}");
+        }
+    }
+
+    private static void PersistBwQuickReplyContextsToDisk()
+    {
+        var path = _bwQuickReplyContextPath;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        try
+        {
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrWhiteSpace(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            var snapshot = _bwQuickReplyContexts
+                .Select(x => new PersistedBwQuickReplyContext
+                {
+                    Key = x.Key,
+                    PlayerName = x.Value.PlayerName,
+                    CreatedAtUtc = x.Value.CreatedAtUtc
+                })
+                .OrderByDescending(x => x.CreatedAtUtc)
+                .Take(BwQuickReplyContextMaxEntries)
+                .ToList();
+
+            var json = JsonConvert.SerializeObject(snapshot, Formatting.None);
+            lock (_bwQuickReplyContextFileLock)
+            {
+                File.WriteAllText(path, json, Encoding.UTF8);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[快捷回复] 回复上下文保存失败: {ex.Message}");
+        }
+    }
+
+    private static void LoadRuntimeStateFromDisk()
+    {
+        var path = _runtimeStatePath;
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return;
+        }
+
+        try
+        {
+            RuntimeStateSnapshot? state;
+            lock (_runtimeStateFileLock)
+            {
+                var json = File.ReadAllText(path, Encoding.UTF8);
+                state = JsonConvert.DeserializeObject<RuntimeStateSnapshot>(json);
+            }
+
+            if (state == null)
+            {
+                return;
+            }
+
+            var needsRewrite = false;
+            var now = DateTimeOffset.UtcNow;
+            var restoredApprovalCount = 0;
+            var restoredIdiomSessionCount = 0;
+
+            lock (_customTitleApprovalLock)
+            {
+                _pendingCustomTitleRequests.Clear();
+                _pendingSkinAddRequests.Clear();
+                _pendingPlayerIdFontSizeRequests.Clear();
+
+                foreach (var item in state.PendingCustomTitleRequests ?? new List<PersistedPendingCustomTitleRequest>())
+                {
+                    if (item == null || string.IsNullOrWhiteSpace(item.ReviewMessageId) || string.IsNullOrWhiteSpace(item.ApplicantQq))
+                    {
+                        needsRewrite = true;
+                        continue;
+                    }
+
+                    _pendingCustomTitleRequests[item.ReviewMessageId.Trim()] = new PendingCustomTitleRequest
+                    {
+                        ApplicantQq = item.ApplicantQq.Trim(),
+                        ApplicantBjdName = item.ApplicantBjdName?.Trim() ?? string.Empty,
+                        ApplicantBjdUuid = item.ApplicantBjdUuid?.Trim() ?? string.Empty,
+                        Title = item.Title?.Trim() ?? string.Empty,
+                        ColorHex = string.IsNullOrWhiteSpace(item.ColorHex) ? "FFFFFF" : item.ColorHex.Trim(),
+                        CreatedAtUtc = item.CreatedAtUtc
+                    };
+                    restoredApprovalCount++;
+                }
+
+                foreach (var item in state.PendingSkinAddRequests ?? new List<PersistedPendingSkinAddRequest>())
+                {
+                    if (item == null
+                        || string.IsNullOrWhiteSpace(item.ReviewMessageId)
+                        || string.IsNullOrWhiteSpace(item.ApplicantQq)
+                        || string.IsNullOrWhiteSpace(item.OfficialId))
+                    {
+                        needsRewrite = true;
+                        continue;
+                    }
+
+                    _pendingSkinAddRequests[item.ReviewMessageId.Trim()] = new PendingSkinAddRequest
+                    {
+                        ApplicantQq = item.ApplicantQq.Trim(),
+                        ApplicantBjdName = item.ApplicantBjdName?.Trim() ?? string.Empty,
+                        ApplicantBjdUuid = item.ApplicantBjdUuid?.Trim() ?? string.Empty,
+                        OfficialId = item.OfficialId.Trim(),
+                        CreatedAtUtc = item.CreatedAtUtc
+                    };
+                    restoredApprovalCount++;
+                }
+
+                foreach (var item in state.PendingPlayerIdFontSizeRequests ?? new List<PersistedPendingPlayerIdFontSizeRequest>())
+                {
+                    if (item == null || string.IsNullOrWhiteSpace(item.ReviewMessageId) || string.IsNullOrWhiteSpace(item.ApplicantQq))
+                    {
+                        needsRewrite = true;
+                        continue;
+                    }
+
+                    _pendingPlayerIdFontSizeRequests[item.ReviewMessageId.Trim()] = new PendingPlayerIdFontSizeRequest
+                    {
+                        ApplicantQq = item.ApplicantQq.Trim(),
+                        ApplicantBjdName = item.ApplicantBjdName?.Trim() ?? string.Empty,
+                        IdFontSize = item.IdFontSize,
+                        CreatedAtUtc = item.CreatedAtUtc
+                    };
+                    restoredApprovalCount++;
+                }
+            }
+
+            lock (_pendingUpdateLock)
+            {
+                _pendingUpdateText = (state.PendingUpdateText ?? string.Empty).Trim();
+                _pendingUpdateDeliveredUsers.Clear();
+                foreach (var userId in state.PendingUpdateDeliveredUsers ?? new List<string>())
+                {
+                    if (string.IsNullOrWhiteSpace(userId))
+                    {
+                        needsRewrite = true;
+                        continue;
+                    }
+
+                    _pendingUpdateDeliveredUsers.Add(userId.Trim());
+                }
+            }
+
+            _idiomChainSessions.Clear();
+            foreach (var item in state.IdiomChainSessions ?? new List<PersistedIdiomChainSession>())
+            {
+                if (item == null || string.IsNullOrWhiteSpace(item.GroupId))
+                {
+                    needsRewrite = true;
+                    continue;
+                }
+
+                if (now - item.LastUpdatedUtc > IdiomChainSessionTimeout)
+                {
+                    needsRewrite = true;
+                    continue;
+                }
+
+                var session = new IdiomChainSession
+                {
+                    LastIdiom = item.LastIdiom?.Trim() ?? string.Empty,
+                    ExpectedStartChar = item.ExpectedStartChar?.Trim() ?? string.Empty,
+                    LastUpdatedUtc = item.LastUpdatedUtc
+                };
+
+                foreach (var idiom in item.UsedIdioms ?? new List<string>())
+                {
+                    if (string.IsNullOrWhiteSpace(idiom))
+                    {
+                        needsRewrite = true;
+                        continue;
+                    }
+
+                    if (session.UsedIdioms.Count >= IdiomChainMaxUsedCount)
+                    {
+                        needsRewrite = true;
+                        break;
+                    }
+
+                    session.UsedIdioms.Add(idiom.Trim());
+                }
+
+                _idiomChainSessions[item.GroupId.Trim()] = session;
+                restoredIdiomSessionCount++;
+            }
+
+            if (restoredApprovalCount > 0 || restoredIdiomSessionCount > 0 || !string.IsNullOrWhiteSpace(_pendingUpdateText))
+            {
+                Console.WriteLine($"[状态恢复] 审核队列={restoredApprovalCount}，接龙会话={restoredIdiomSessionCount}");
+            }
+
+            if (needsRewrite)
+            {
+                PersistRuntimeStateToDisk();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[状态恢复] 运行状态恢复失败: {ex.Message}");
+        }
+    }
+
+    private static void PersistRuntimeStateToDisk()
+    {
+        var path = _runtimeStatePath;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        try
+        {
+            var snapshot = new RuntimeStateSnapshot();
+
+            lock (_customTitleApprovalLock)
+            {
+                snapshot.PendingCustomTitleRequests = _pendingCustomTitleRequests
+                    .Select(x => new PersistedPendingCustomTitleRequest
+                    {
+                        ReviewMessageId = x.Key,
+                        ApplicantQq = x.Value.ApplicantQq,
+                        ApplicantBjdName = x.Value.ApplicantBjdName,
+                        ApplicantBjdUuid = x.Value.ApplicantBjdUuid,
+                        Title = x.Value.Title,
+                        ColorHex = x.Value.ColorHex,
+                        CreatedAtUtc = x.Value.CreatedAtUtc
+                    })
+                    .OrderBy(x => x.CreatedAtUtc)
+                    .ToList();
+
+                snapshot.PendingSkinAddRequests = _pendingSkinAddRequests
+                    .Select(x => new PersistedPendingSkinAddRequest
+                    {
+                        ReviewMessageId = x.Key,
+                        ApplicantQq = x.Value.ApplicantQq,
+                        ApplicantBjdName = x.Value.ApplicantBjdName,
+                        ApplicantBjdUuid = x.Value.ApplicantBjdUuid,
+                        OfficialId = x.Value.OfficialId,
+                        CreatedAtUtc = x.Value.CreatedAtUtc
+                    })
+                    .OrderBy(x => x.CreatedAtUtc)
+                    .ToList();
+
+                snapshot.PendingPlayerIdFontSizeRequests = _pendingPlayerIdFontSizeRequests
+                    .Select(x => new PersistedPendingPlayerIdFontSizeRequest
+                    {
+                        ReviewMessageId = x.Key,
+                        ApplicantQq = x.Value.ApplicantQq,
+                        ApplicantBjdName = x.Value.ApplicantBjdName,
+                        IdFontSize = x.Value.IdFontSize,
+                        CreatedAtUtc = x.Value.CreatedAtUtc
+                    })
+                    .OrderBy(x => x.CreatedAtUtc)
+                    .ToList();
+            }
+
+            lock (_pendingUpdateLock)
+            {
+                snapshot.PendingUpdateText = (_pendingUpdateText ?? string.Empty).Trim();
+                snapshot.PendingUpdateDeliveredUsers = _pendingUpdateDeliveredUsers
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Select(x => x.Trim())
+                    .Distinct(StringComparer.Ordinal)
+                    .OrderBy(x => x, StringComparer.Ordinal)
+                    .ToList();
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            foreach (var kv in _idiomChainSessions)
+            {
+                if (string.IsNullOrWhiteSpace(kv.Key))
+                {
+                    continue;
+                }
+
+                var session = kv.Value;
+                if (session == null || now - session.LastUpdatedUtc > IdiomChainSessionTimeout)
+                {
+                    continue;
+                }
+
+                List<string> usedIdioms;
+                try
+                {
+                    usedIdioms = session.UsedIdioms
+                        .Where(x => !string.IsNullOrWhiteSpace(x))
+                        .Select(x => x.Trim())
+                        .Distinct(StringComparer.Ordinal)
+                        .Take(IdiomChainMaxUsedCount)
+                        .ToList();
+                }
+                catch
+                {
+                    continue;
+                }
+
+                snapshot.IdiomChainSessions.Add(new PersistedIdiomChainSession
+                {
+                    GroupId = kv.Key,
+                    UsedIdioms = usedIdioms,
+                    LastIdiom = session.LastIdiom,
+                    ExpectedStartChar = session.ExpectedStartChar,
+                    LastUpdatedUtc = session.LastUpdatedUtc
+                });
+            }
+
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrWhiteSpace(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            var json = JsonConvert.SerializeObject(snapshot, Formatting.None);
+            lock (_runtimeStateFileLock)
+            {
+                File.WriteAllText(path, json, Encoding.UTF8);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[状态保存] 运行状态保存失败: {ex.Message}");
         }
     }
 
@@ -4011,10 +4933,14 @@ UUID: {binding.BjdUuid}
             _pendingUpdateText = value;
             _pendingUpdateDeliveredUsers.Clear();
         }
+
+        PersistRuntimeStateToDisk();
     }
 
     private static string? TryConsumePendingUpdateTextForUser(string? userId)
     {
+        var changed = false;
+        string? updateText = null;
         lock (_pendingUpdateLock)
         {
             if (string.IsNullOrWhiteSpace(_pendingUpdateText))
@@ -4033,8 +4959,16 @@ UUID: {binding.BjdUuid}
             }
 
             _pendingUpdateDeliveredUsers.Add(userId);
-            return _pendingUpdateText.Trim();
+            changed = true;
+            updateText = _pendingUpdateText.Trim();
         }
+
+        if (changed)
+        {
+            PersistRuntimeStateToDisk();
+        }
+
+        return updateText;
     }
 
     private static async Task SendPendingUpdateToGroupIfExistsAsync(string groupId, string? msgId, string? userId)
@@ -6360,6 +7294,18 @@ UUID: {binding.BjdUuid}
         Console.WriteLine($"[调用][私聊] user={userId ?? string.Empty}, cmd={safeRaw}");
     }
 
+    private static void LogCallEchoText(string channel, string? groupId, string? userId, string callText, string status)
+    {
+        var text = CompactLogText(callText, 200);
+        if (string.Equals(channel, "group", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"[叫词][群] group={groupId ?? string.Empty}, user={userId ?? string.Empty}, status={status}, text={text}");
+            return;
+        }
+
+        Console.WriteLine($"[叫词][私聊] user={userId ?? string.Empty}, status={status}, text={text}");
+    }
+
     private static void LogBotTextSend(string channel, string targetId, string content)
     {
         var text = CompactLogText(content, 200);
@@ -6647,7 +7593,7 @@ UUID: {binding.BjdUuid}
             return;
         }
 
-        var tracked = cmd is "bw" or "lb" or "sess" or "session" or "help" or "帮助" or "喊话"
+        var tracked = cmd is "bw" or "lb" or "sess" or "session" or "help" or "帮助" or "菜单" or "喊话"
             or "sw"
             or "bind" or "skin" or "bg" or "ch" or "群发" or "群发编辑" or "群发编辑文本"
             or "update" or "更新" or "开关ai" or "ai开关" or "起床文本"
